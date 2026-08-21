@@ -64,3 +64,4 @@ async def predict_heatmap(
         "prediction_window_hours": future_hours,
         "based_on_period": f"{start_date} to {end_date}"
     }
+

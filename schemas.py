@@ -170,6 +170,7 @@ class IncidentReportResponse(BaseModel):
     status: str
     ml_confidence: float
     keywords: List[str]               # ← remains List[str]
+    assigned_to: Optional[int] = None   # <-- ADD THIS
     created_at: datetime
     updated_at: Optional[datetime]
     image_paths: Optional[List[str]] = []  # Add this

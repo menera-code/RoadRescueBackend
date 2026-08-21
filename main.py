@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from services.enhanced_incident_ml_service import EnhancedIncidentMLService
+
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -30,8 +30,9 @@ from fastapi import File, UploadFile, Form, Request
 from services.predictor import predict_text, analyze_image, analyze_video
 from schemas import LegalComplianceResponse
 # Import your modules
-
+from models import ResponderLocation
 import models
+import logging
 import crud_users
 from routing_service import RoutingService
 from database import engine
@@ -44,7 +45,7 @@ from gemini_map_service import map_service  # NEW: Import Gemini map service
 from realtime_routing_service import RealTimeRoutingService
 from websocket_manager import connection_manager
 # Add these imports with your other imports
-from services.enhanced_incident_ml_service import EnhancedIncidentMLService
+
 from schemas import (
     IncidentReportCreate, 
     IncidentReportResponse,
@@ -70,6 +71,10 @@ from fastapi import Depends, HTTPException, status
 from deps import get_current_user  # or wherever your get_current_user is
 from models import User
 from models import IncidentReport, ResponderResolvedIncident
+
+# ✨ NEW: Import the updated ml_analytics (you rewrote this)
+import ml_analytics
+
 # Create tables
 models.Base.metadata.create_all(bind=engine)
 
@@ -78,13 +83,12 @@ app = FastAPI(title="RESQAPP API")
 # ========== CORS MIDDLEWARE ==========
 app.add_middleware(
     CORSMiddleware,
-   # allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000", "http://127.0.0.1:8000"],
-    allow_origins=["*"],  # Allow all origins for development (change in production!)
+    allow_origins=["*"],  # Restrict in production!
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],  # Add this line - important!
-    max_age=600,  # Cache preflight requests for 10 minutes
+    expose_headers=["*"],
+    max_age=600,
 )
 
 @app.middleware("http")
@@ -935,29 +939,10 @@ async def test_gemini():
             "message": f"Gemini test failed: {str(e)}",
             "timestamp": datetime.now().isoformat()
         }
-# ========== INCIDENT ML SERVICE ==========
-import asyncio
-from database import SessionLocal   # adjust import as needed
 
-async def process_incident_background(incident_id: str, ml_result: dict):
-    """
-    Background processing for incident reports.
-    """
-    try:
-        # Create a new database session for this background task
-        db = SessionLocal()
-        try:
-            print(f"📊 Processing report {incident_id} in background...")
-            # TODO: Add your actual background logic here
-            # e.g., send notifications, update real-time stats, etc.
-            await asyncio.sleep(1)  # simulate work
-            print(f"✅ Report {incident_id} processed successfully")
-        finally:
-            db.close()
-    except Exception as e:
-        print(f"❌ Background processing failed for {incident_id}: {e}")
-# Initialize enhanced ML service
-ml_service = EnhancedIncidentMLService(use_enhanced=True)
+# ========== INCIDENT ML SERVICE (REMOVED OLD ENHANCED ML) ==========
+# The old ml_service = EnhancedIncidentMLService(...) line has been removed.
+# We now use services.predictor exclusively.
 
 # ========== INCIDENT REPORTING ENDPOINTS ==========
 from datetime import datetime
@@ -970,10 +955,8 @@ async def submit_incident_report(
     db: Session = Depends(get_db)
 ):
     try:
-        # Parse form data
         form = await request.form()
         
-        # Extract text fields
         description = form.get("description")
         latitude = float(form.get("latitude"))
         longitude = float(form.get("longitude"))
@@ -982,20 +965,21 @@ async def submit_incident_report(
         address = form.get("address")
         emergency_contact = form.get("emergency_contact")
         
-        # Validation
         if not description or not latitude or not longitude or not barangay:
             raise HTTPException(status_code=400, detail="Missing required fields")
         
-        # Prepare file directories
         IMAGE_DIR = "uploads/images"
         VIDEO_DIR = "uploads/videos"
         os.makedirs(IMAGE_DIR, exist_ok=True)
         os.makedirs(VIDEO_DIR, exist_ok=True)
         
-        image_paths = []
-        video_paths = []
+        # Store both relative (for frontend) and absolute (for ML) paths
+        image_paths = []       # relative URLs for frontend
+        video_paths = []       # relative URLs for frontend
+        image_abs_paths = []   # absolute paths for analysis
+        video_abs_paths = []   # absolute paths for analysis
         
-        # Process files
+        # Find all file indices
         file_indices = set()
         for key in form.keys():
             if key.startswith("file_"):
@@ -1022,52 +1006,55 @@ async def submit_incident_report(
             filename = f"{uuid.uuid4()}{ext}"
             
             if file_type == "image":
-                file_path = os.path.join(IMAGE_DIR, filename)
                 rel_path = f"/{IMAGE_DIR}/{filename}"
+                abs_path = os.path.abspath(rel_path.lstrip('/'))  # convert to absolute
                 image_paths.append(rel_path)
+                image_abs_paths.append(abs_path)
+                with open(abs_path, "wb") as f:
+                    shutil.copyfileobj(file_obj.file, f)
             else:
-                file_path = os.path.join(VIDEO_DIR, filename)
                 rel_path = f"/{VIDEO_DIR}/{filename}"
+                abs_path = os.path.abspath(rel_path.lstrip('/'))
                 video_paths.append(rel_path)
-            
-            with open(file_path, "wb") as f:
-                shutil.copyfileobj(file_obj.file, f)
+                video_abs_paths.append(abs_path)
+                with open(abs_path, "wb") as f:
+                    shutil.copyfileobj(file_obj.file, f)
         
-        # ========== ML PREDICTIONS WITH ERROR HANDLING ==========
+        # ========== ML PREDICTIONS ==========
         text_pred = None
         image_pred = None
         video_pred = None
         
         try:
-            from services.predictor import predict_text, analyze_image, analyze_video
-            
-            # 1. Text analysis
+            # 1. Text analysis (always works)
             text_pred = predict_text(description)
             print(f"✅ Text prediction: {text_pred}")
             
-            # 2. Image analysis (first image only)
-            if image_paths:
-                first_image = image_paths[0].lstrip('/')
-                if os.path.exists(first_image):
-                    image_pred = analyze_image(first_image)
-                    print(f"✅ Image analysis: {image_pred}")
+            # 2. Image analysis – use absolute path
+            if image_abs_paths:
+                first_abs = image_abs_paths[0]
+                print(f"📁 Analysing image: {first_abs} (exists: {os.path.exists(first_abs)})")
+                if os.path.exists(first_abs):
+                    image_pred = analyze_image(first_abs)
+                    print(f"✅ Image analysis result: {image_pred}")
                 else:
-                    print(f"⚠️ Image file not found: {first_image}")
+                    print(f"❌ Image file not found at {first_abs}")
             
-            # 3. Video analysis (first video only)
-            if video_paths:
-                first_video = video_paths[0].lstrip('/')
-                if os.path.exists(first_video):
-                    video_pred = analyze_video(first_video)
+            # 3. Video analysis – use absolute path
+            if video_abs_paths:
+                first_vid_abs = video_abs_paths[0]
+                print(f"📁 Analysing video: {first_vid_abs} (exists: {os.path.exists(first_vid_abs)})")
+                if os.path.exists(first_vid_abs):
+                    video_pred = analyze_video(first_vid_abs)
                     print(f"✅ Video analysis: {video_pred}")
                 else:
-                    print(f"⚠️ Video file not found: {first_video}")
+                    print(f"❌ Video file not found at {first_vid_abs}")
         
         except Exception as e:
             print(f"❌ ML prediction failed: {e}")
             import traceback
             traceback.print_exc()
-            # Fallback values
+            # Fallback text (ensures at least text analysis exists)
             text_pred = {
                 "incident_type": "Other",
                 "severity": "medium",
@@ -1110,7 +1097,7 @@ async def submit_incident_report(
             text_analysis=text_pred
         )
         
-        # Background task
+        # Background task (optional)
         background_tasks.add_task(
             process_incident_background,
             incident.id,
@@ -1143,10 +1130,8 @@ async def submit_incident_report(
         return response
     
     except HTTPException as he:
-        # Re-raise HTTP exceptions (they already include CORS headers)
         raise he
     except Exception as e:
-        # Catch any other exception and return a clean error
         print("🔥 Unhandled exception in /api/reports/submit:")
         traceback.print_exc()
         return JSONResponse(
@@ -1158,19 +1143,27 @@ async def submit_incident_report(
             }
         )
 
+# ─── UPDATED: Text-only ML analysis using predictor ───
 @app.post("/api/ml/analyze-text", response_model=MLTextAnalysisResponse)
 async def analyze_text(text: str = Form(...)):
     try:
-        result = await ml_service.analyze_text_only(text)
-        # result currently has "all_predictions" as dict, e.g.:
-        # {"type": "Fire", "confidence": 0.4, "all_predictions": {"Accident":0.0, "Fire":1.0, ...}, ...}
+        # Use the predictor directly
+        result = predict_text(text)
+        # result has keys: incident_type, severity, type_confidence, severity_confidence,
+        #                   all_type_scores (dict), all_severity_scores (dict)
         
-        # Convert all_predictions dict to a list in a fixed order
+        # Convert all_type_scores dict to a list in a fixed order for the response
         type_order = ["Accident", "Fire", "Medical", "Crime", "Natural Disaster", "Infrastructure", "Other"]
-        probs_list = [result["all_predictions"].get(t, 0.0) for t in type_order]
-        result["all_predictions"] = probs_list
+        probs_list = [result["all_type_scores"].get(t, 0.0) for t in type_order]
         
-        return result
+        # Build response matching MLTextAnalysisResponse schema
+        return {
+            "incident_type": result["incident_type"],
+            "confidence": result["type_confidence"],
+            "severity": result["severity"],
+            "severity_confidence": result["severity_confidence"],
+            "all_predictions": probs_list,
+        }
     except Exception as e:
         print(f"🔥 ML analysis error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1193,6 +1186,7 @@ async def get_incident_types():
         "description": "AI-powered incident classification types"
     }
 
+# ─── UPDATED: ML status endpoint (no more enhanced ML) ───
 @app.get("/api/ml/status")
 async def get_ml_service_status():
     """
@@ -1200,14 +1194,18 @@ async def get_ml_service_status():
     """
     return {
         "status": "operational",
-        "text_classifier": "available",
-        "image_analyzer": "available", 
-        "video_analyzer": "available",
+        "text_classifier": "available (predictor)",
+        "image_analyzer": "available (predictor)", 
+        "video_analyzer": "available (predictor)",
         "models_loaded": True,
         "timestamp": datetime.now().isoformat()
     }
 
+# ─── REMOVED: /api/ml/train endpoint ───
+# Training is not done on Render; you can re-implement with lazy imports if needed.
 
+# ========== OTHER ENDPOINTS ==========
+# (All the remaining endpoints are unchanged – they use crud_incidents, ml_analytics, etc.)
 
 @app.get("/api/reports", response_model=List[IncidentReportResponse])
 async def get_incidents(
@@ -1235,13 +1233,40 @@ async def get_my_incidents(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """
-    Get incidents reported by the current user
-    """
     incidents = crud_incidents.get_user_incidents(
         db, user_id=current_user.id, skip=skip, limit=limit
     )
-    return incidents
+    # Build response manually to include assigned_to
+    result = []
+    for inc in incidents:
+        result.append({
+            "id": inc.id,
+            "description": inc.description,
+            "incident_type": inc.incident_type,
+            "severity": inc.severity,
+            "priority": inc.priority,
+            "ml_confidence": inc.ml_confidence,
+            "latitude": inc.latitude,
+            "longitude": inc.longitude,
+            "barangay": inc.barangay,
+            "address": inc.address,
+            "contact_number": inc.contact_number,
+            "emergency_contact": inc.emergency_contact,
+            "image_paths": inc.image_paths,
+            "video_paths": inc.video_paths,
+            "text_analysis": inc.text_analysis,
+            "keywords": inc.keywords,
+            "status": inc.status,
+            "verified_by": inc.verified_by,
+            "assigned_to": inc.assigned_to,   # <-- ADD THIS LINE
+            "created_at": inc.created_at,
+            "updated_at": inc.updated_at,
+            "resolved_at": inc.resolved_at,
+            "user_id": inc.user_id,
+            "city": inc.city,
+            "province": inc.province,
+        })
+    return result
 
 @app.get("/api/reports/{report_id}", response_model=IncidentReportResponse)
 async def get_incident(
@@ -1249,13 +1274,37 @@ async def get_incident(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """
-    Get incident details by ID
-    """
     incident = crud_incidents.get_incident_report(db, report_id)
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-    return incident
+    # Convert to dict and ensure assigned_to is included
+    return {
+        "id": incident.id,
+        "description": incident.description,
+        "incident_type": incident.incident_type,
+        "severity": incident.severity,
+        "priority": incident.priority,
+        "ml_confidence": incident.ml_confidence,
+        "latitude": incident.latitude,
+        "longitude": incident.longitude,
+        "barangay": incident.barangay,
+        "address": incident.address,
+        "contact_number": incident.contact_number,
+        "emergency_contact": incident.emergency_contact,
+        "image_paths": incident.image_paths,
+        "video_paths": incident.video_paths,
+        "text_analysis": incident.text_analysis,
+        "keywords": incident.keywords,
+        "status": incident.status,
+        "verified_by": incident.verified_by,
+        "assigned_to": incident.assigned_to,   # <-- ADD THIS LINE
+        "created_at": incident.created_at,
+        "updated_at": incident.updated_at,
+        "resolved_at": incident.resolved_at,
+        "user_id": incident.user_id,
+        "city": incident.city,
+        "province": incident.province,
+    }
 
 @app.put("/api/reports/{report_id}/status")
 async def update_status(
@@ -1499,26 +1548,11 @@ async def get_incident_types(db: Session = Depends(get_db)):
             ]
         }
 
-# Add new endpoints for model management
-@app.post("/api/ml/train")
-async def train_ml_models(
-    background_tasks: BackgroundTasks,
-    current_user = Depends(get_current_user)
-):
-    """Start ML model training"""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    
-    background_tasks.add_task(
-        ml_service.train_models,
-        "datasets/incident_images"  # Your dataset path
-    )
-    
-    return {"message": "Model training started in background"}
+# ─── REMOVED: /api/ml/train endpoint ───
+# Training is not done on Render; you can re-implement with lazy imports if needed.
+# The endpoint has been removed to prevent accidental training on the server.
 
-
-
-# ML Analytics Endpoints
+# ML Analytics Endpoints (using your updated ml_analytics)
 @app.get("/api/reports/my-ml-stats")
 async def get_my_ml_stats(
     days: int = 30,
@@ -1562,16 +1596,8 @@ async def generate_synthetic_data(count: int = 100):
     result["timestamp"] = datetime.now().isoformat()
     return result
 
-app.get("/api/ml/models/status")
-async def get_model_status():
-    """Get enhanced ML model status"""
-    return {
-        "text_classifier": "enhanced" if ml_service.use_enhanced else "basic",
-        "image_analyzer": "enhanced" if ml_service.use_enhanced else "basic",
-        "video_analyzer": "enhanced" if ml_service.use_enhanced else "basic",
-        "can_train": True,
-        "training_buffer_size": len(ml_service.training_buffer)
-    }
+# ─── REMOVED: /api/ml/models/status (old enhanced ML status) ───
+# Replaced by /api/ml/status above.
 
 app.include_router(admin_router)
 
@@ -1817,3 +1843,56 @@ def upload_profile_avatar(
     db.commit()
     
     return {"profile_photo": file_path}
+
+
+logging.basicConfig(level=logging.INFO)
+
+@app.get("/api/responder/location/{responder_id}")
+async def get_responder_location(
+    responder_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    try:
+        # Verify the user has an incident assigned to this responder
+        incident = db.query(IncidentReport).filter(
+            IncidentReport.user_id == current_user.id,
+            IncidentReport.assigned_to == responder_id
+        ).first()
+        
+        if not incident:
+            raise HTTPException(
+                status_code=403,
+                detail=f"No incident found for user {current_user.id} assigned to responder {responder_id}"
+            )
+        
+        # Fetch responder's last known location
+        loc = db.query(ResponderLocation).filter(
+            ResponderLocation.responder_id == responder_id
+        ).first()
+        
+        if not loc:
+            return {
+                "exists": False,
+                "message": "Responder has not shared location yet"
+            }
+        
+        # Build response safely
+        response = {
+            "exists": True,
+            "responder_id": responder_id,
+            "lat": loc.latitude,
+            "lng": loc.longitude,
+            "accuracy": loc.accuracy,
+        }
+        # Safely handle updated_at (if it's None, set to None)
+        if loc.updated_at:
+            response["updated_at"] = loc.updated_at.isoformat()
+        else:
+            response["updated_at"] = None
+        
+        return response
+        
+    except Exception as e:
+        logging.error(f"Error in get_responder_location: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

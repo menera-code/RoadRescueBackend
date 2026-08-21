@@ -1,0 +1,21 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+gunicorn==23.0.0
+python-multipart==0.0.20
+pydantic==2.10.4
+SQLAlchemy==2.0.36
+PyMySQL==1.1.1
+python-dotenv==1.0.1
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+requests==2.32.3
+google-generativeai==0.8.3
+google-genai==1.2.0
+
+# ML Inference (Lazy loaded)
+torch==2.5.1
+ultralytics==8.3.47
+transformers==4.47.1
+opencv-python-headless==4.10.0.84
+Pillow==11.0.0
+numpy==1.26.4

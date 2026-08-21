@@ -1,136 +1,236 @@
-"""
-ML Prediction Service – Road Rescue Edition
-- Always predicts incident type = "Accident"
-- Extracts vehicle types from text description
-- Detects vehicles from images/videos using YOLO (pre-trained on COCO)
-- Severity classification remains (zero-shot)
-"""
-from ultralytics import YOLO
-from transformers import pipeline
-import cv2
 import os
-import json
-from collections import Counter
-from typing import Dict, List
+import cv2
+import tempfile
+from typing import Dict, Any, Optional, List
+import torch
+import numpy as np
+from PIL import Image
 
-# ---------- TEXT CLASSIFIER (zero-shot) ----------
-_text_classifier = pipeline(
-    "zero-shot-classification",
-    model="facebook/bart-large-mnli"
-)
+# We will NOT load these at import time
+# Instead, we use global variables set to None
+_yolo_model = None
+_text_classifier = None
+
+# ==========================================
+# LAZY LOADERS (Models load only when called)
+# ==========================================
+
+def get_yolo_model():
+    """Lazy load YOLO model (only when first image/video is analyzed)."""
+    global _yolo_model
+    if _yolo_model is None:
+        print("🔄 Loading YOLOv8n model (lazy load triggered)...")
+        from ultralytics import YOLO
+        
+        # Force CPU usage to save memory on Render
+        device = 'cpu'
+        _yolo_model = YOLO("yolov8n.pt")
+        _yolo_model.to(device)  # Ensure it's on CPU
+        print("✅ YOLO model loaded successfully.")
+    return _yolo_model
+
+def get_text_classifier():
+    """Lazy load BART zero-shot classifier (only when text is analyzed)."""
+    global _text_classifier
+    if _text_classifier is None:
+        print("🔄 Loading BART zero-shot classifier (lazy load triggered)...")
+        from transformers import pipeline
+        _text_classifier = pipeline(
+            "zero-shot-classification",
+            model="facebook/bart-large-mnli",
+            device=-1  # Force CPU (-1 means CPU)
+        )
+        print("✅ BART classifier loaded successfully.")
+    return _text_classifier
+
+# ==========================================
+# PREDICTION FUNCTIONS
+# ==========================================
+
+# Incident types (consistent with your database)
+INCIDENT_TYPES = [
+    "Accident", "Fire", "Medical", "Crime", 
+    "Natural Disaster", "Infrastructure", "Other"
+]
 
 SEVERITY_LEVELS = ["low", "medium", "high", "critical"]
 
-# Expanded vehicle keywords (English + common local terms)
-VEHICLE_KEYWORDS = [
-    "car", "cars", "sedan", "suv", "van", "pickup", "hatchback",
-    "truck", "trucks", "lorry", "dump truck",
-    "motorcycle", "motorbike", "bike", "scooter", "moped",
-    "tricycle", "trike", "pedicab",
-    "bus", "minibus", "coaster",
-    "bicycle", "bike",
-    "jeepney", "jeep",
-    "trailer", "semi-trailer", "heavy vehicle",
-    "ambulance", "fire truck", "police car"
-]
-
-def extract_vehicles_from_text(text: str) -> List[str]:
-    """Return list of unique vehicle types mentioned in the description."""
-    text_lower = text.lower()
-    found = []
-    for vehicle in VEHICLE_KEYWORDS:
-        if vehicle in text_lower:
-            # Capitalize first letter for display
-            found.append(vehicle.title())
-    # Remove duplicates while preserving order
-    unique = []
-    for v in found:
-        if v not in unique:
-            unique.append(v)
-    return unique
-
-def predict_text(description: str) -> Dict:
+def predict_text(text: str) -> Dict[str, Any]:
     """
-    Always returns incident_type = "Accident".
-    Extracts mentioned vehicles and predicts severity.
+    Analyze text description using lazy-loaded BART.
+    Returns incident type and severity.
     """
-    severity_result = _text_classifier(description, SEVERITY_LEVELS)
-    vehicles = extract_vehicles_from_text(description)
-    return {
-        "incident_type": "Accident",          # Always road accident
-        "type_confidence": 1.0,
-        "severity": severity_result["labels"][0],
-        "severity_confidence": round(severity_result["scores"][0], 2),
-        "all_severity_scores": {
-            label: round(score, 2)
-            for label, score in zip(severity_result["labels"], severity_result["scores"])
-        },
-        "mentioned_vehicles": vehicles       # New field for UI
-    }
-
-# ---------- IMAGE / VIDEO DETECTION (YOLO) ----------
-_yolo = YOLO('yolov8n.pt')  # pre-trained on COCO
-
-# Map YOLO COCO class IDs to vehicle types (only relevant ones)
-VEHICLE_CLASSES = {
-    2: "car",          # car
-    3: "motorcycle",   # motorcycle
-    5: "bus",          # bus
-    7: "truck",        # truck
-    1: "bicycle",      # bicycle
-    # Note: Class 4 = airplane (ignore), 6 = train (rare)
-}
-
-def analyze_image(image_path: str) -> Dict:
-    """
-    Detect objects in a single image.
-    Returns all objects + a breakdown of detected vehicles.
-    """
-    results = _yolo(image_path)
-    detections = []
-    vehicles_detected = Counter()
-    for r in results:
-        for box in r.boxes:
-            cls = int(box.cls[0])
-            label = _yolo.names[cls]
-            conf = float(box.conf[0])
-            detections.append({"label": label, "confidence": round(conf, 2)})
-            if cls in VEHICLE_CLASSES:
-                vehicles_detected[VEHICLE_CLASSES[cls]] += 1
-    return {
-        "objects": detections,
-        "count": len(detections),
-        "vehicles": dict(vehicles_detected)   # e.g. {"car": 2, "motorcycle": 1}
-    }
-
-def analyze_video(video_path: str, frame_interval: int = 30) -> Dict:
-    """
-    Extract frames and analyze each, aggregating vehicle detections.
-    """
-    cap = cv2.VideoCapture(video_path)
-    frame_count = 0
-    all_vehicles = Counter()
-    temp_dir = "/tmp/video_frames"
-    os.makedirs(temp_dir, exist_ok=True)
+    if not text or len(text.strip()) < 3:
+        return {
+            "incident_type": "Other",
+            "severity": "medium",
+            "type_confidence": 0.5,
+            "severity_confidence": 0.5,
+            "all_type_scores": {t: 0.0 for t in INCIDENT_TYPES},
+            "all_severity_scores": {s: 0.0 for s in SEVERITY_LEVELS}
+        }
     
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_count % frame_interval == 0:
-            temp_path = os.path.join(temp_dir, f"frame_{frame_count}.jpg")
-            cv2.imwrite(temp_path, frame)
-            res = analyze_image(temp_path)
-            for vehicle, count in res.get("vehicles", {}).items():
-                all_vehicles[vehicle] += count
-            os.remove(temp_path)
-        frame_count += 1
-    cap.release()
+    classifier = get_text_classifier()  # Loads BART here if not loaded
     
-    # Summarize detected vehicles (most common first)
-    summary = [{"label": k, "count": v} for k, v in all_vehicles.most_common(10)]
+    # 1. Classify incident type
+    type_result = classifier(text, candidate_labels=INCIDENT_TYPES)
+    predicted_type = type_result['labels'][0]
+    type_confidence = type_result['scores'][0]
+    all_type_scores = dict(zip(type_result['labels'], type_result['scores']))
+    
+    # 2. Classify severity
+    severity_result = classifier(text, candidate_labels=SEVERITY_LEVELS)
+    predicted_severity = severity_result['labels'][0]
+    severity_confidence = severity_result['scores'][0]
+    all_severity_scores = dict(zip(severity_result['labels'], severity_result['scores']))
+    
     return {
-        "summary": summary,
-        "total_frames_analyzed": frame_count // frame_interval,
-        "vehicles": dict(all_vehicles)
+        "incident_type": predicted_type,
+        "severity": predicted_severity,
+        "type_confidence": type_confidence,
+        "severity_confidence": severity_confidence,
+        "all_type_scores": all_type_scores,
+        "all_severity_scores": all_severity_scores
     }
+
+def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Analyze image using lazy-loaded YOLO.
+    Returns detected objects and a textual description.
+    """
+    if not os.path.exists(image_path):
+        print(f"❌ Image not found: {image_path}")
+        return None
+    
+    try:
+        model = get_yolo_model()  # Loads YOLO here if not loaded
+        
+        # Run inference
+        results = model(image_path)
+        
+        # Extract detections
+        detections = []
+        for r in results:
+            boxes = r.boxes
+            if boxes is not None:
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    name = model.names[cls]
+                    detections.append({
+                        "object": name,
+                        "confidence": conf,
+                        "class_id": cls
+                    })
+        
+        # Simple heuristic: if we detect fire, vehicle crash, etc.
+        detection_names = [d["object"].lower() for d in detections]
+        incident_type = "Other"
+        
+        # Map common YOLO objects to incident types
+        fire_objects = ["fire", "smoke", "flame"]
+        accident_objects = ["car", "truck", "bus", "motorcycle", "bicycle", "person"]
+        medical_objects = ["person"]  # but we need context
+        
+        if any(o in detection_names for o in fire_objects):
+            incident_type = "Fire"
+        elif any(o in detection_names for o in accident_objects):
+            # Check if multiple vehicles or vehicle + person indicates accident
+            vehicle_count = sum(1 for o in detection_names if o in accident_objects)
+            if vehicle_count >= 2:
+                incident_type = "Accident"
+            else:
+                incident_type = "Accident"  # default to accident for vehicle presence
+        
+        # If person is detected and no clear accident/fire, suggest Medical
+        if incident_type == "Other" and "person" in detection_names:
+            incident_type = "Medical"
+        
+        return {
+            "incident_type": incident_type,
+            "detections": detections,
+            "confidence": max([d["confidence"] for d in detections]) if detections else 0.5,
+            "total_objects": len(detections)
+        }
+        
+    except Exception as e:
+        print(f"❌ Image analysis failed: {e}")
+        return None
+
+def analyze_video(video_path: str, sample_frames: int = 5) -> Optional[Dict[str, Any]]:
+    """
+    Analyze video by sampling frames using lazy-loaded YOLO.
+    """
+    if not os.path.exists(video_path):
+        print(f"❌ Video not found: {video_path}")
+        return None
+    
+    try:
+        model = get_yolo_model()  # Loads YOLO here if not loaded
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames == 0:
+            cap.release()
+            return None
+        
+        # Sample frames evenly
+        frame_indices = [int(i * total_frames / (sample_frames + 1)) for i in range(1, sample_frames + 1)]
+        all_detections = []
+        
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            
+            # Save frame to temp file for YOLO
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                temp_path = tmp.name
+                cv2.imwrite(temp_path, frame)
+            
+            # Analyze the frame
+            result = analyze_image(temp_path)
+            if result and result.get("detections"):
+                all_detections.extend(result["detections"])
+            
+            # Clean up temp file
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+        
+        cap.release()
+        
+        # Aggregate detections
+        if not all_detections:
+            return None
+        
+        # Count occurrences
+        object_counts = {}
+        for d in all_detections:
+            name = d["object"]
+            object_counts[name] = object_counts.get(name, 0) + 1
+        
+        # Determine incident type
+        incident_type = "Other"
+        if "fire" in object_counts or "smoke" in object_counts:
+            incident_type = "Fire"
+        elif len(object_counts) >= 2:  # Multiple vehicle types = likely accident
+            incident_type = "Accident"
+        elif "person" in object_counts:
+            incident_type = "Medical"
+        
+        return {
+            "incident_type": incident_type,
+            "object_counts": object_counts,
+            "total_detections": len(all_detections),
+            "frames_analyzed": len(frame_indices)
+        }
+        
+    except Exception as e:
+        print(f"❌ Video analysis failed: {e}")
+        return None

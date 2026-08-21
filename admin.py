@@ -62,8 +62,8 @@ from collections import Counter
 from datetime import datetime
 from fastapi import Query, HTTPException
 from sqlalchemy.orm import Session
-from sklearn.neighbors import KernelDensity
-import numpy as np
+# ❌ Removed: import numpy as np
+# ❌ Removed: from sklearn.neighbors import KernelDensity
 import math
 from typing import Optional
 
@@ -316,7 +316,7 @@ async def get_incidents(
     current_user: User = Depends(get_current_user)
 ):
     query = db.query(IncidentReport)
-    if assigned_to:
+    if assigned_to is not None:    
         query = query.filter(IncidentReport.assigned_to == assigned_to)
     if status:
         query = query.filter(IncidentReport.status == status)
@@ -400,11 +400,13 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
+
 def get_closest_responder(incident_lat: float, incident_lon: float, db: Session) -> Optional[int]:
-    """Return closest active responder (fallback to any active responder if no recent location)."""
     from datetime import datetime, timedelta
-    cutoff = datetime.utcnow() - timedelta(minutes=30)
-    responders_with_loc = db.query(ResponderLocation).join(
+    cutoff = datetime.utcnow() - timedelta(minutes=60)
+
+    # 1. Fresh locations (last 60 min)
+    fresh = db.query(ResponderLocation).join(
         User, ResponderLocation.responder_id == User.id
     ).filter(
         User.role == "responder",
@@ -412,22 +414,39 @@ def get_closest_responder(incident_lat: float, incident_lon: float, db: Session)
         ResponderLocation.updated_at >= cutoff
     ).all()
 
-    if responders_with_loc:
-        closest_id = None
-        min_dist = float("inf")
-        for r in responders_with_loc:
-            dist = haversine(incident_lat, incident_lon, r.latitude, r.longitude)
-            if dist < min_dist:
-                min_dist = dist
-                closest_id = r.responder_id
-        return closest_id
+    if fresh:
+        closest = min(fresh, key=lambda r: haversine(incident_lat, incident_lon, r.latitude, r.longitude))
+        return closest.responder_id
 
-    # Fallback: any active responder without live location
+    # 2. Any location (stale)
+    stale = db.query(ResponderLocation).join(
+        User, ResponderLocation.responder_id == User.id
+    ).filter(
+        User.role == "responder",
+        User.status == "active"
+    ).all()
+
+    if stale:
+        closest = min(stale, key=lambda r: haversine(incident_lat, incident_lon, r.latitude, r.longitude))
+        return closest.responder_id
+
+    # 3. Fallback: any active responder
     any_responder = db.query(User).filter(
         User.role == "responder",
         User.status == "active"
     ).first()
     return any_responder.id if any_responder else None
+
+
+def assign_closest_responder(incident: IncidentReport, admin_user: User, db: Session) -> str:
+    if incident.latitude is None or incident.longitude is None:
+        return "No location to determine closest responder."
+    responder_id = get_closest_responder(incident.latitude, incident.longitude, db)
+    if responder_id is None:
+        return "No active responder available."
+    # Use the existing assign function
+    return assign_incident_to_responder(incident, responder_id, admin_user, db)
+
 
 def assign_incident_to_responder(
     incident: IncidentReport,
@@ -557,42 +576,17 @@ async def assign_incident_to_responder(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    from models import IncidentReport, User, IncidentAssignmentLog
-    
+
     incident = db.query(IncidentReport).filter(IncidentReport.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
+
+    # Use the helper that does the actual assignment
+    assign_incident_to_responder_helper(incident, responder_id, current_user, db)
     
-    previous_assigned_to = incident.assigned_to
-    
-    if responder_id is not None:
-        responder = db.query(User).filter(User.id == responder_id, User.role == "responder").first()
-        if not responder:
-            raise HTTPException(status_code=404, detail="Responder not found")
-        incident.assigned_to = responder_id
-        message = f"Assigned to {responder.full_name}"
-        action = "assign"
-    else:
-        incident.assigned_to = None
-        message = "Unassigned"
-        action = "unassign"
-    
-    incident.updated_at = datetime.utcnow()
-    
-    # Log the assignment/unassignment
-    log_entry = IncidentAssignmentLog(
-        incident_id=incident_id,
-        assigned_by=current_user.id,
-        assigned_to=responder_id if responder_id is not None else previous_assigned_to,
-        
-        action=action
-    )
-    db.add(log_entry)
-    
-    db.commit()
-    
-    return {"message": message, "incident_id": incident_id, "assigned_to": incident.assigned_to}
+    # Ensure the incident is refreshed
+    db.refresh(incident)
+    return {"message": "Assignment updated", "incident_id": incident_id, "assigned_to": incident.assigned_to}
 # ================= ANALYTICS ENDPOINTS =================
 def assign_incident_to_responder_helper(
     incident: IncidentReport,
@@ -647,6 +641,8 @@ async def get_ml_analytics(
     stats = ml_analytics.get_user_ml_stats(user_id, days, db)
     return MLAnalyticsResponse(**stats)
 
+# ── Unified ML performance endpoints (only one set) ──
+
 @router.get("/ml-performance")
 async def admin_ml_performance(
     db: Session = Depends(get_db),
@@ -685,111 +681,186 @@ async def get_analytics_data(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Enhanced analytics with date filtering, hourly, weekly, barangay, and resolution time."""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    """Enhanced analytics with date filtering, hourly, weekly, barangay, resolution time, vehicle types, and barangay trends."""
+    try:
+        if current_user.role != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
 
-    # Parse dates, default to last 30 days if missing
-    if start_date:
-        try:
-            start = datetime.strptime(start_date, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid start_date format")
-    else:
-        start = datetime.utcnow() - timedelta(days=30)
+        # Parse dates, default to last 30 days if missing
+        if start_date:
+            try:
+                start = datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid start_date format")
+        else:
+            start = datetime.utcnow() - timedelta(days=30)
 
-    if end_date:
-        try:
-            end = datetime.strptime(end_date, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid end_date format")
-    else:
-        end = datetime.utcnow()
+        if end_date:
+            try:
+                end = datetime.strptime(end_date, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_date format")
+        else:
+            end = datetime.utcnow()
 
-    # Ensure end is inclusive of the full day
-    end = end + timedelta(days=1)
+        # Ensure end is inclusive of the full day
+        end = end + timedelta(days=1)
 
-    # Base query for filtered period
-    base = db.query(IncidentReport).filter(
-        IncidentReport.created_at >= start,
-        IncidentReport.created_at < end
-    )
-
-    # Incidents by type
-    type_rows = base.filter(IncidentReport.incident_type.isnot(None))\
-        .with_entities(IncidentReport.incident_type, func.count(IncidentReport.id))\
-        .group_by(IncidentReport.incident_type).all()
-    incidentsByType = [{"name": t, "count": c, "percentage": 0} for t, c in type_rows]
-
-    # Severity distribution
-    sev_rows = base.filter(IncidentReport.severity.isnot(None))\
-        .with_entities(IncidentReport.severity, func.count(IncidentReport.id))\
-        .group_by(IncidentReport.severity).all()
-    severityDistribution = [{"level": s, "count": c} for s, c in sev_rows]
-
-    # Daily activity
-    daily_rows = base.with_entities(
-        func.date(IncidentReport.created_at).label('date'),
-        func.count(IncidentReport.id)
-    ).group_by('date').order_by('date').all()
-    daily = [{"date": d.strftime("%Y-%m-%d"), "activity": cnt} for d, cnt in daily_rows]
-
-    # Weekly trend (last 4 weeks)
-    week_start = start - timedelta(days=start.weekday())  # align to Monday
-    weeks = []
-    for i in range(4):
-        w_start = week_start + timedelta(weeks=i)
-        w_end = w_start + timedelta(weeks=1)
-        cnt = db.query(func.count(IncidentReport.id)).filter(
-            IncidentReport.created_at >= w_start,
-            IncidentReport.created_at < w_end
-        ).scalar() or 0
-        weeks.append({
-            "week": w_start.strftime("%Y-%m-%d"),
-            "count": cnt
-        })
-    weeklyTrend = weeks
-
-    # Barangay distribution (top 10)
-    barangay_rows = base.filter(IncidentReport.barangay.isnot(None))\
-        .with_entities(IncidentReport.barangay, func.count(IncidentReport.id))\
-        .group_by(IncidentReport.barangay).order_by(func.count(IncidentReport.id).desc()).limit(10).all()
-    barangayDistribution = [{"barangay": b, "count": c} for b, c in barangay_rows]
-
-    # Hourly distribution
-    hourly_rows = base.filter(IncidentReport.created_at.isnot(None))\
-        .with_entities(
-            func.extract('hour', IncidentReport.created_at).label('hour'),
-            func.count(IncidentReport.id)
-        ).group_by('hour').order_by('hour').all()
-    hourlyDistribution = [{"hour": int(h), "count": c} for h, c in hourly_rows]
-
-    # Average resolution time (in hours) for resolved incidents
-    resolved = base.filter(IncidentReport.status == "resolved",
-                           IncidentReport.resolved_at.isnot(None),
-                           IncidentReport.created_at.isnot(None))\
-        .with_entities(IncidentReport.created_at, IncidentReport.resolved_at).all()
-    if resolved:
-        total_hours = sum(
-            (r.resolved_at - r.created_at).total_seconds() / 3600 for r in resolved
+        # Base query for filtered period
+        base = db.query(IncidentReport).filter(
+            IncidentReport.created_at >= start,
+            IncidentReport.created_at < end
         )
-        avg_resolution = round(total_hours / len(resolved), 2)
-    else:
-        avg_resolution = 0
 
-    return {
-        "incidentsByType": incidentsByType,
-        "severityDistribution": severityDistribution,
-        "activitySummary": {
-            "daily": daily,
-            "weekly": weeklyTrend,
-            "monthly": []  # you can add monthly later if needed
-        },
-        "barangayDistribution": barangayDistribution,
-        "hourlyDistribution": hourlyDistribution,
-        "weeklyTrend": weeklyTrend,
-        "avgResolutionHours": avg_resolution
-    }
+        # Incidents by type
+        type_rows = base.filter(IncidentReport.incident_type.isnot(None))\
+            .with_entities(IncidentReport.incident_type, func.count(IncidentReport.id))\
+            .group_by(IncidentReport.incident_type).all()
+        incidentsByType = [{"name": t, "count": c, "percentage": 0} for t, c in type_rows]
+
+        # Severity distribution
+        sev_rows = base.filter(IncidentReport.severity.isnot(None))\
+            .with_entities(IncidentReport.severity, func.count(IncidentReport.id))\
+            .group_by(IncidentReport.severity).all()
+        severityDistribution = [{"level": s, "count": c} for s, c in sev_rows]
+
+        # Daily activity
+        daily_rows = base.with_entities(
+            func.date(IncidentReport.created_at).label('date'),
+            func.count(IncidentReport.id)
+        ).group_by('date').order_by('date').all()
+        daily = [{"date": d.strftime("%Y-%m-%d"), "activity": cnt} for d, cnt in daily_rows]
+
+        # Weekly trend (last 4 weeks) – we compute from the start date
+        week_start = start - timedelta(days=start.weekday())  # align to Monday
+        weeks = []
+        for i in range(4):
+            w_start = week_start + timedelta(weeks=i)
+            w_end = w_start + timedelta(weeks=1)
+            cnt = db.query(func.count(IncidentReport.id)).filter(
+                IncidentReport.created_at >= w_start,
+                IncidentReport.created_at < w_end
+            ).scalar() or 0
+            weeks.append({
+                "week": w_start.strftime("%Y-%m-%d"),
+                "count": cnt
+            })
+        weeklyTrend = weeks
+
+        # Barangay distribution (top 10) – for the filtered period
+        barangay_rows = base.filter(IncidentReport.barangay.isnot(None))\
+            .with_entities(IncidentReport.barangay, func.count(IncidentReport.id))\
+            .group_by(IncidentReport.barangay).order_by(func.count(IncidentReport.id).desc()).limit(10).all()
+        barangayDistribution = [{"barangay": b, "count": c} for b, c in barangay_rows]
+
+        # Hourly distribution
+        hourly_rows = base.filter(IncidentReport.created_at.isnot(None))\
+            .with_entities(
+                func.extract('hour', IncidentReport.created_at).label('hour'),
+                func.count(IncidentReport.id)
+            ).group_by('hour').order_by('hour').all()
+        hourlyDistribution = [{"hour": int(h), "count": c} for h, c in hourly_rows]
+
+        # Average resolution time (in hours) for resolved incidents
+        resolved = base.filter(IncidentReport.status == "resolved",
+                               IncidentReport.resolved_at.isnot(None),
+                               IncidentReport.created_at.isnot(None))\
+            .with_entities(IncidentReport.created_at, IncidentReport.resolved_at).all()
+        if resolved:
+            total_hours = sum(
+                (r.resolved_at - r.created_at).total_seconds() / 3600 for r in resolved
+            )
+            avg_resolution = round(total_hours / len(resolved), 2)
+        else:
+            avg_resolution = 0
+
+        # ========== SAFE VEHICLE TYPE DISTRIBUTION ==========
+        from collections import defaultdict
+        import json
+
+        vehicle_counts = defaultdict(int)
+        incidents_in_period = base.all()
+
+        for inc in incidents_in_period:
+            # Image analysis
+            if inc.image_analysis:
+                try:
+                    img_data = json.loads(inc.image_analysis)
+                    if isinstance(img_data, dict):
+                        vehicles = img_data.get("vehicles", {})
+                        if isinstance(vehicles, dict):
+                            for vehicle, count in vehicles.items():
+                                if isinstance(count, (int, float)):
+                                    vehicle_counts[vehicle] += int(count)
+                except Exception as e:
+                    print(f"⚠️ Image analysis error for incident {inc.id}: {e}")
+
+            # Text analysis
+            if inc.text_analysis:
+                try:
+                    txt_data = json.loads(inc.text_analysis)
+                    if isinstance(txt_data, dict):
+                        vehicles = txt_data.get("mentioned_vehicles")
+                        if isinstance(vehicles, list):
+                            for vehicle in vehicles:
+                                vehicle_counts[vehicle] += 1
+                except Exception as e:
+                    print(f"⚠️ Text analysis error for incident {inc.id}: {e}")
+
+        vehicle_types = [{"type": k, "count": v} for k, v in vehicle_counts.items() if v > 0]
+        vehicle_types.sort(key=lambda x: -x["count"])
+
+        # ========== SAFE BARANGAY TRENDS (Today, Week, Month) ==========
+        
+        now = datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = now - timedelta(days=7)
+        month_start = now - timedelta(days=30)
+
+        barangay_periods = {}
+        for period, start_dt in [("today", today_start), ("week", week_start), ("month", month_start)]:
+            results = db.query(IncidentReport.barangay, func.count(IncidentReport.id))\
+                        .filter(IncidentReport.created_at >= start_dt)\
+                        .filter(IncidentReport.barangay.isnot(None))\
+                        .group_by(IncidentReport.barangay)\
+                        .all()
+            for barangay, cnt in results:
+                if barangay not in barangay_periods:
+                    barangay_periods[barangay] = {"today": 0, "week": 0, "month": 0}
+                barangay_periods[barangay][period] = cnt
+
+        barangay_trends = []
+        for barangay, periods in barangay_periods.items():
+            barangay_trends.append({
+                "barangay": barangay,
+                "today": periods["today"],
+                "week": periods["week"],
+                "month": periods["month"],
+                "total": periods["today"] + periods["week"] + periods["month"]
+            })
+        barangay_trends.sort(key=lambda x: -x["total"])
+        barangay_trends = barangay_trends[:10]
+
+        return {
+            "incidentsByType": incidentsByType,
+            "severityDistribution": severityDistribution,
+            "activitySummary": {
+                "daily": daily,
+                "weekly": weeklyTrend,
+                "monthly": []  # optional
+            },
+            "barangayDistribution": barangayDistribution,
+            "hourlyDistribution": hourlyDistribution,
+            "weeklyTrend": weeklyTrend,
+            "avgResolutionHours": avg_resolution,
+            "vehicleTypes": vehicle_types,
+            "barangayTrends": barangay_trends,
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 # ================= USER CREATION ENDPOINT =================
 
 @router.post("/users", response_model=UserProfileOut)
@@ -1192,38 +1263,15 @@ def delete_alert(
     return {"message": "Alert deleted"}
 
 
-@router.get("/ml-performance")
-async def admin_ml_performance(current_user: User = Depends(get_current_user)):
-    """Return model performance metrics from ml_model_versions."""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    db = SessionLocal()
-    try:
-        return ml_analytics.get_model_performance(db)
-    finally:
-        db.close()
+# ─── The following three endpoints already exist above; they are duplicates.
+# I'm removing them to avoid conflicts. Keep the ones above.
 
-@router.get("/dataset-status")
-async def admin_dataset_status(current_user: User = Depends(get_current_user)):
-    """Return storage info and training dataset counts."""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    db = SessionLocal()
-    try:
-        return ml_analytics.get_dataset_status(db)
-    finally:
-        db.close()
-
-@router.get("/ml-stats-summary")
-async def admin_ml_stats_summary(days: int = 30, current_user: User = Depends(get_current_user)):
-    """Return summary stats (by type, severity, average confidence)."""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    db = SessionLocal()
-    try:
-        return ml_analytics.get_training_stats(days, db)
-    finally:
-        db.close()
+# @router.get("/ml-performance")
+# ...
+# @router.get("/dataset-status")
+# ...
+# @router.get("/ml-stats-summary")
+# ...
 
 @router.get("/training-data-status")
 async def admin_training_data_status(
@@ -1317,14 +1365,11 @@ async def approve_incident(
 
     incident.status = "in-progress"
     incident.updated_at = datetime.utcnow()
+    db.commit()  # commit status change first
 
-    # Auto-assign if not already assigned
-    if incident.assigned_to is None and incident.latitude and incident.longitude:
-        closest = get_closest_responder(incident.latitude, incident.longitude, db)
-        if closest:
-            assign_incident_to_responder(incident, closest, current_user, db)
-
-    db.commit()
+    if incident.assigned_to is None:
+        msg = assign_closest_responder(incident, current_user, db)
+        # log or notify
     return {"message": "Incident approved and marked in-progress"}
 
 @router.delete("/incidents/{incident_id}")
@@ -1514,11 +1559,18 @@ async def delete_legal_compliance(
 def get_media_analysis(
     incident_id: str,
     db: Session = Depends(get_db),
-    current_admin: User = Depends(get_current_admin)
+    current_user: User = Depends(get_current_user)   # ← now uses current user (not admin)
 ):
     incident = crud_incidents.get_incident_report(db, incident_id)
     if not incident:
         raise HTTPException(404, "Incident not found")
+    
+    # ✅ Allow: admin, the reporter (user_id), or the assigned responder (assigned_to)
+    if current_user.role != "admin" and \
+       current_user.id != incident.user_id and \
+       current_user.id != incident.assigned_to:
+        raise HTTPException(403, "Not authorized to view this report's analysis")
+    
     return {
         "text_analysis": json.loads(incident.text_analysis) if incident.text_analysis else None,
         "image_analysis": json.loads(incident.image_analysis) if incident.image_analysis else None,
@@ -1556,6 +1608,7 @@ def predict_hotspots(
     db: Session = Depends(get_db),
     current_admin: User = Depends(get_current_admin)
 ):
+    # ✅ Lazy‑load heavy libraries only when this endpoint is called
     try:
         from sklearn.neighbors import KernelDensity
         import numpy as np
@@ -1615,18 +1668,99 @@ async def auto_assign_all_incidents(
     if current_user.role != "admin":
         raise HTTPException(403, "Admin access required")
 
+    # 1. Get all active responders
+    active_responders = db.query(User).filter(
+        User.role == "responder",
+        User.status == "active"
+    ).all()
+    if not active_responders:
+        return {"assigned": 0, "total_unassigned": 0, "errors": ["No active responders available"]}
+
+    # 2. Current assignment counts and locations
+    responder_counts = {}
+    responder_locations = {}
+    for resp in active_responders:
+        count = db.query(IncidentReport).filter(
+            IncidentReport.assigned_to == resp.id,
+            IncidentReport.status.in_(["pending", "in-progress"])
+        ).count()
+        responder_counts[resp.id] = count
+        loc = db.query(ResponderLocation).filter(
+            ResponderLocation.responder_id == resp.id
+        ).order_by(ResponderLocation.updated_at.desc()).first()
+        responder_locations[resp.id] = loc
+
+    # 3. Unassigned incidents (oldest first)
     unassigned = db.query(IncidentReport).filter(
         IncidentReport.assigned_to.is_(None),
         IncidentReport.status.in_(["pending", "in-progress"]),
         IncidentReport.latitude.isnot(None),
         IncidentReport.longitude.isnot(None)
-    ).all()
+    ).order_by(IncidentReport.created_at.asc()).all()
 
     assigned_count = 0
-    for inc in unassigned:
-        closest = get_closest_responder(inc.latitude, inc.longitude, db)
-        if closest:
-            assign_incident_to_responder(inc, closest, current_user, db)
-            assigned_count += 1
+    errors = []
+    assignments = []
 
-    return {"assigned": assigned_count, "total_unassigned": len(unassigned)}
+    for inc in unassigned:
+        best_responder_id = None
+        best_score = None
+
+        for resp in active_responders:
+            loc = responder_locations.get(resp.id)
+            if loc:
+                dist = haversine(inc.latitude, inc.longitude, loc.latitude, loc.longitude)
+            else:
+                dist = 100000
+            score = responder_counts[resp.id] * 1000 + dist
+            if best_score is None or score < best_score:
+                best_score = score
+                best_responder_id = resp.id
+
+        if best_responder_id is None:
+            errors.append(f"No suitable responder for incident {inc.id}")
+            continue
+
+        # ✅ Perform assignment with immediate commit
+        try:
+            inc.assigned_to = best_responder_id
+            inc.updated_at = datetime.utcnow()
+            
+            log = IncidentAssignmentLog(
+                incident_id=inc.id,
+                assigned_by=current_user.id,
+                assigned_to=best_responder_id,
+                action="assign"
+            )
+            db.add(log)
+            db.commit()          # <-- commit now
+            db.refresh(inc)      # <-- refresh to get latest data
+
+            assigned_count += 1
+            assignments.append({"incident_id": inc.id, "assigned_to": best_responder_id})
+            responder_counts[best_responder_id] += 1
+        except Exception as e:
+            db.rollback()
+            errors.append(f"Error assigning incident {inc.id}: {str(e)}")
+
+    return {
+        "assigned": assigned_count,
+        "total_unassigned": len(unassigned),
+        "assignments": assignments,
+        "errors": errors
+    }
+
+@router.post("/incidents/{incident_id}/auto-assign")
+async def auto_assign_single_incident(
+    incident_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    incident = db.query(IncidentReport).filter(IncidentReport.id == incident_id).first()
+    if not incident:
+        raise HTTPException(404, "Incident not found")
+    if incident.assigned_to is not None:
+        return {"message": "Already assigned", "assigned_to": incident.assigned_to}
+    msg = assign_closest_responder(incident, current_user, db)
+    db.commit()
+    return {"message": msg, "assigned_to": incident.assigned_to}
