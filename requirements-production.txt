@@ -19,3 +19,4 @@ transformers==4.47.1
 opencv-python-headless==4.10.0.84
 Pillow==11.0.0
 numpy==1.26.4
+tenacity==8.5.0
