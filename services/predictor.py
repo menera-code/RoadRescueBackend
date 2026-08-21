@@ -95,19 +95,32 @@ def predict_text(text: str) -> Dict[str, Any]:
     }
 
 def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
-    """
-    Analyze image using lazy-loaded YOLO.
-    Returns detected objects and a textual description.
-    """
+    """Analyze image using lazy-loaded YOLO – reads image with OpenCV to bypass extension issues."""
     if not os.path.exists(image_path):
         print(f"❌ Image not found: {image_path}")
         return None
     
     try:
-        model = get_yolo_model()  # Loads YOLO here if not loaded
+        # Try OpenCV first
+        img = cv2.imread(image_path)
         
-        # Run inference
-        results = model(image_path)
+        # If OpenCV fails, try PIL as fallback
+        if img is None:
+            print(f"⚠️ OpenCV failed, trying PIL fallback...")
+            from PIL import Image
+            import numpy as np
+            try:
+                img = np.array(Image.open(image_path).convert('RGB'))
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # YOLO expects BGR
+            except Exception as e:
+                print(f"❌ PIL fallback also failed: {e}")
+                return None
+        
+        # Load YOLO lazily
+        model = get_yolo_model()
+        
+        # Run inference on the image array (NOT the file path)
+        results = model(img)
         
         # Extract detections
         detections = []
@@ -124,27 +137,18 @@ def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
                         "class_id": cls
                     })
         
-        # Simple heuristic: if we detect fire, vehicle crash, etc.
+        # Determine incident type (same logic)
         detection_names = [d["object"].lower() for d in detections]
         incident_type = "Other"
         
-        # Map common YOLO objects to incident types
         fire_objects = ["fire", "smoke", "flame"]
         accident_objects = ["car", "truck", "bus", "motorcycle", "bicycle", "person"]
-        medical_objects = ["person"]  # but we need context
         
         if any(o in detection_names for o in fire_objects):
             incident_type = "Fire"
         elif any(o in detection_names for o in accident_objects):
-            # Check if multiple vehicles or vehicle + person indicates accident
-            vehicle_count = sum(1 for o in detection_names if o in accident_objects)
-            if vehicle_count >= 2:
-                incident_type = "Accident"
-            else:
-                incident_type = "Accident"  # default to accident for vehicle presence
-        
-        # If person is detected and no clear accident/fire, suggest Medical
-        if incident_type == "Other" and "person" in detection_names:
+            incident_type = "Accident"
+        elif "person" in detection_names:
             incident_type = "Medical"
         
         return {
@@ -156,7 +160,9 @@ def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
         
     except Exception as e:
         print(f"❌ Image analysis failed: {e}")
-        return None
+        import traceback
+        traceback.print_exc()
+        return Nones
 
 def analyze_video(video_path: str, sample_frames: int = 5) -> Optional[Dict[str, Any]]:
     """
