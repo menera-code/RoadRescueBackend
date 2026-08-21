@@ -197,7 +197,7 @@ async def process_incident_background(incident_id: str, ml_result: dict):
     # For now, just a placeholder.
     await asyncio.sleep(1)
     print(f"✅ Report {incident_id} processed successfully")
-    
+
 # Initialize services
 realtime_service = RealTimeRoutingService()
 
@@ -1172,6 +1172,7 @@ async def analyze_text(text: str = Form(...)):
             "severity": result["severity"],
             "severity_confidence": result["severity_confidence"],
             "all_predictions": probs_list,
+            "keywords": [] 
         }
     except Exception as e:
         print(f"🔥 ML analysis error: {e}")
