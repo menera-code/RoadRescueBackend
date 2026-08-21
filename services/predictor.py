@@ -38,7 +38,8 @@ def get_text_classifier():
         _text_classifier = pipeline(
             "zero-shot-classification",
             model="facebook/bart-large-mnli",
-            device=-1  # Force CPU (-1 means CPU)
+            device=-1,  # Force CPU (-1 means CPU)
+            framework='pt'
         )
         print("✅ BART classifier loaded successfully.")
     return _text_classifier

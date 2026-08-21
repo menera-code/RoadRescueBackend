@@ -189,6 +189,15 @@ class UserPositionRequest(BaseModel):
     lng: float
     accuracy: Optional[float] = None
 
+
+async def process_incident_background(incident_id: str, ml_result: dict):
+    """Background processing for new incidents (e.g., notifications)."""
+    print(f"📊 Processing report {incident_id} in background...")
+    # Add any async tasks you need (email, SMS, etc.)
+    # For now, just a placeholder.
+    await asyncio.sleep(1)
+    print(f"✅ Report {incident_id} processed successfully")
+    
 # Initialize services
 realtime_service = RealTimeRoutingService()
 
