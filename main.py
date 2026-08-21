@@ -1012,6 +1012,9 @@ async def submit_incident_report(
             ext = os.path.splitext(file_obj.filename)[1]
             if not ext:
                 ext = ".jpg" if file_type == "image" else ".mp4"
+            # 👇 ADD THIS BLOCK
+            if ext == ".jfif":
+                ext = ".jpg"   # Rename to .jpg since it's the same format
             filename = f"{uuid.uuid4()}{ext}"
             
             if file_type == "image":
@@ -1167,7 +1170,7 @@ async def analyze_text(text: str = Form(...)):
         
         # Build response matching MLTextAnalysisResponse schema
         return {
-            "incident_type": result["incident_type"],
+            "type": result["incident_type"],
             "confidence": result["type_confidence"],
             "severity": result["severity"],
             "severity_confidence": result["severity_confidence"],
