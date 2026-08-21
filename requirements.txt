@@ -1,0 +1,44 @@
+# ==========================================
+# ROADRESCUE BACKEND - PRODUCTION REQUIREMENTS
+# For Render deployment (Python 3.11)
+# ==========================================
+
+# Core Web Framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+gunicorn==23.0.0
+python-multipart==0.0.20
+pydantic==2.10.4
+
+# Database
+SQLAlchemy==2.0.36
+PyMySQL==1.1.1
+
+# Environment & Security
+python-dotenv==1.0.1
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+argon2-cffi==23.1.0
+bcrypt==4.2.0
+
+# HTTP & API Clients
+requests==2.32.3
+tenacity==8.5.0
+
+# Google Gemini
+google-generativeai==0.8.3
+google-genai==1.2.0
+
+# Machine Learning Inference (Lazy-loaded)
+torch==2.5.1
+ultralytics==8.3.47
+transformers==4.47.1
+opencv-python-headless==4.10.0.84
+Pillow==11.0.0
+numpy==1.26.4
+
+# Additional – if you use Pydantic EmailStr (schemas.py)
+email-validator==2.2.0
+
+# If you use httpx (optional, but some code might)
+# httpx==0.28.1
