@@ -6,15 +6,12 @@ from typing import Dict, Any, Optional, List
 import numpy as np
 from PIL import Image
 
-# ==========================================
-# GEMINI TEXT CLASSIFIER (LIGHTWEIGHT)
-# ==========================================
 _yolo_model = None
 
+# ==========================================
+# GEMINI TEXT CLASSIFIER (with vehicle mentions)
+# ==========================================
 def predict_text_with_gemini(text: str) -> Dict[str, Any]:
-    """
-    Use Gemini AI to classify text – no local model.
-    """
     try:
         import google.generativeai as genai
         from gemini_map_service import map_service
@@ -22,7 +19,6 @@ def predict_text_with_gemini(text: str) -> Dict[str, Any]:
         if map_service.client is None:
             raise Exception("Gemini client not initialized")
         
-        # Use the same model as your map service (from env)
         model = genai.GenerativeModel(map_service.model)
         
         prompt = f"""
@@ -35,19 +31,20 @@ def predict_text_with_gemini(text: str) -> Dict[str, Any]:
         2. severity: choose from ["low", "medium", "high", "critical"]
         3. confidence: a number between 0 and 1
         4. keywords: a list of important words (max 5)
+        5. mentioned_vehicles: a list of vehicle types mentioned (e.g., ["car", "truck", "motorcycle"])
 
         Return JSON exactly like:
         {{
-            "incident_type": "Fire",
-            "severity": "high",
-            "confidence": 0.92,
-            "keywords": ["flames", "building", "evacuate"]
+            "incident_type": "Accident",
+            "severity": "medium",
+            "confidence": 0.95,
+            "keywords": ["car", "motorcycle", "collision"],
+            "mentioned_vehicles": ["car", "motorcycle"]
         }}
         """
         
         response = model.generate_content(prompt)
         raw = response.text.strip()
-        # Remove markdown code fences if present
         if raw.startswith('```json'):
             raw = raw[7:]
         if raw.endswith('```'):
@@ -61,19 +58,34 @@ def predict_text_with_gemini(text: str) -> Dict[str, Any]:
             "severity_confidence": result.get("confidence", 0.5),
             "all_type_scores": {t: 0.0 for t in INCIDENT_TYPES},
             "all_severity_scores": {s: 0.0 for s in SEVERITY_LEVELS},
-            "keywords": result.get("keywords", [])
+            "keywords": result.get("keywords", []),
+            "mentioned_vehicles": result.get("mentioned_vehicles", [])
         }
     except Exception as e:
-        print(f"⚠️ Gemini classification failed: {e}, using fallback")
+        print(f"⚠️ Gemini failed: {e}, using fallback")
         return simple_keyword_classifier(text)
 
 def simple_keyword_classifier(text: str) -> Dict[str, Any]:
-    """Fallback using keyword matching – zero memory footprint."""
     text_lower = text.lower()
     incident_type = "Other"
     severity = "medium"
     confidence = 0.6
+    mentioned_vehicles = []
     
+    # Detect vehicles
+    vehicle_keywords = {
+        "car": ["car", "sedan", "suv", "van"],
+        "truck": ["truck", "lorry", "dump truck"],
+        "motorcycle": ["motorcycle", "motorbike", "bike", "scooter"],
+        "bus": ["bus", "minibus"],
+        "bicycle": ["bicycle", "bike"],
+        "jeepney": ["jeepney", "jeep"],
+    }
+    for vehicle_type, keywords in vehicle_keywords.items():
+        if any(k in text_lower for k in keywords):
+            mentioned_vehicles.append(vehicle_type)
+    
+    # Determine type
     if any(k in text_lower for k in ["fire", "flame", "smoke", "burn"]):
         incident_type = "Fire"
         severity = "high"
@@ -105,12 +117,11 @@ def simple_keyword_classifier(text: str) -> Dict[str, Any]:
         "type_confidence": confidence,
         "severity_confidence": confidence,
         "all_type_scores": {t: 0.0 for t in INCIDENT_TYPES},
-        "all_severity_scores": {s: 0.0 for s in SEVERITY_LEVELS}
+        "all_severity_scores": {s: 0.0 for s in SEVERITY_LEVELS},
+        "keywords": [],
+        "mentioned_vehicles": mentioned_vehicles
     }
 
-# ==========================================
-# MAIN TEXT PREDICT FUNCTION
-# ==========================================
 def predict_text(text: str) -> Dict[str, Any]:
     if not text or len(text.strip()) < 3:
         return {
@@ -119,12 +130,13 @@ def predict_text(text: str) -> Dict[str, Any]:
             "type_confidence": 0.5,
             "severity_confidence": 0.5,
             "all_type_scores": {t: 0.0 for t in INCIDENT_TYPES},
-            "all_severity_scores": {s: 0.0 for s in SEVERITY_LEVELS}
+            "all_severity_scores": {s: 0.0 for s in SEVERITY_LEVELS},
+            "mentioned_vehicles": []
         }
     return predict_text_with_gemini(text)
 
 # ==========================================
-# YOLO LAZY LOADER (unchanged)
+# YOLO LAZY LOADER
 # ==========================================
 def get_yolo_model():
     global _yolo_model
@@ -137,16 +149,24 @@ def get_yolo_model():
     return _yolo_model
 
 # ==========================================
-# INCIDENT TYPES & SEVERITIES
+# HELPER – extract vehicles from detections
 # ==========================================
-INCIDENT_TYPES = [
-    "Accident", "Fire", "Medical", "Crime", 
-    "Natural Disaster", "Infrastructure", "Other"
-]
-SEVERITY_LEVELS = ["low", "medium", "high", "critical"]
+VEHICLE_CLASSES = {
+    'car', 'truck', 'bus', 'motorcycle', 'bicycle',
+    'suv', 'van', 'pickup', 'jeep', 'lorry'
+}
+
+def extract_vehicles(detections: List[Dict]) -> Dict[str, int]:
+    """Count vehicle detections by class name."""
+    vehicles = {}
+    for d in detections:
+        obj = d.get('object', '').lower()
+        if obj in VEHICLE_CLASSES:
+            vehicles[obj] = vehicles.get(obj, 0) + 1
+    return vehicles
 
 # ==========================================
-# IMAGE & VIDEO ANALYSIS (unchanged)
+# IMAGE ANALYSIS (returns vehicles dict)
 # ==========================================
 def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
     if not os.path.exists(image_path):
@@ -163,6 +183,9 @@ def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
             except Exception as e:
                 print(f"❌ PIL fallback also failed: {e}")
                 return None
+        
+        # Resize to speed up inference
+        img = cv2.resize(img, (640, 640))
         
         model = get_yolo_model()
         results = model(img)
@@ -189,9 +212,13 @@ def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
         elif "person" in detection_names:
             incident_type = "Medical"
         
+        # Compute vehicles dict
+        vehicles = extract_vehicles(detections)
+        
         return {
             "incident_type": incident_type,
             "detections": detections,
+            "vehicles": vehicles,          # ✅ frontend expects this
             "confidence": max([d["confidence"] for d in detections]) if detections else 0.5,
             "total_objects": len(detections)
         }
@@ -201,6 +228,9 @@ def analyze_image(image_path: str) -> Optional[Dict[str, Any]]:
         traceback.print_exc()
         return None
 
+# ==========================================
+# VIDEO ANALYSIS (returns vehicles dict)
+# ==========================================
 def analyze_video(video_path: str, sample_frames: int = 5) -> Optional[Dict[str, Any]]:
     if not os.path.exists(video_path):
         print(f"❌ Video not found: {video_path}")
@@ -230,7 +260,7 @@ def analyze_video(video_path: str, sample_frames: int = 5) -> Optional[Dict[str,
                 temp_path = tmp.name
                 cv2.imwrite(temp_path, frame)
             
-            result = analyze_image(temp_path)
+            result = analyze_image(temp_path)  # this already returns vehicles
             if result and result.get("detections"):
                 all_detections.extend(result["detections"])
             
@@ -244,6 +274,14 @@ def analyze_video(video_path: str, sample_frames: int = 5) -> Optional[Dict[str,
         if not all_detections:
             return None
         
+        # Aggregate vehicles across frames
+        vehicle_counts = {}
+        for d in all_detections:
+            obj = d.get('object', '').lower()
+            if obj in VEHICLE_CLASSES:
+                vehicle_counts[obj] = vehicle_counts.get(obj, 0) + 1
+        
+        # Determine incident type
         object_counts = {}
         for d in all_detections:
             name = d["object"]
@@ -260,9 +298,19 @@ def analyze_video(video_path: str, sample_frames: int = 5) -> Optional[Dict[str,
         return {
             "incident_type": incident_type,
             "object_counts": object_counts,
+            "vehicles": vehicle_counts,    # ✅ frontend expects this
             "total_detections": len(all_detections),
             "frames_analyzed": len(frame_indices)
         }
     except Exception as e:
         print(f"❌ Video analysis failed: {e}")
         return None
+
+# ==========================================
+# CONSTANTS (unchanged)
+# ==========================================
+INCIDENT_TYPES = [
+    "Accident", "Fire", "Medical", "Crime",
+    "Natural Disaster", "Infrastructure", "Other"
+]
+SEVERITY_LEVELS = ["low", "medium", "high", "critical"]
