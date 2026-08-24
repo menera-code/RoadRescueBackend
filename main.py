@@ -75,6 +75,13 @@ from models import IncidentReport, ResponderResolvedIncident
 # ✨ NEW: Import the updated ml_analytics (you rewrote this)
 import ml_analytics
 
+# ---------- FIREBASE IMPORTS ----------
+import firebase_admin
+from firebase_admin import credentials, storage
+import tempfile
+import io
+# -------------------------------------
+
 # Create tables
 models.Base.metadata.create_all(bind=engine)
 
@@ -90,6 +97,30 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=600,
 )
+
+# ========== FIREBASE INITIALIZATION ==========
+# For LOCAL testing, uncomment and set path to your downloaded JSON:
+# cred = credentials.Certificate("path/to/your-firebase-adminsdk.json")
+
+# For RENDER (recommended): read from environment variable
+cred_dict = json.loads(os.environ.get("FIREBASE_CRED"))
+cred = credentials.Certificate(cred_dict)
+
+firebase_admin.initialize_app(cred, {
+    'storageBucket': 'roadrescue-storage.firebasestorage.app'   # your bucket name
+})
+bucket = storage.bucket()
+# --------------------------------------------
+
+# Helper: upload bytes to Firebase and return public URL
+def upload_file_to_firebase(file_bytes: bytes, folder: str, filename: str, content_type: str) -> str:
+    """Upload bytes to Firebase Storage and return public URL."""
+    blob_path = f"{folder}/{filename}"   # e.g., "uploads/images/uuid.jpg"
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(file_bytes, content_type=content_type)
+    blob.make_public()
+    return blob.public_url
+
 
 @app.middleware("http")
 async def update_last_active_middleware(request: Request, call_next):
@@ -208,23 +239,26 @@ def upload_avatar(
     credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer()),
     db: Session = Depends(get_db)
 ):
+    """Upload avatar using Firebase Storage"""
     payload = decode_token(credentials.credentials)
     user_id = int(payload.get("sub"))
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    ext = file.filename.split(".")[-1]
-    filename = f"user_{user.id}.{ext}"
-    file_path = f"{UPLOAD_DIR}/{filename}"
+    # Read bytes
+    file_bytes = file.file.read()
+    ext = os.path.splitext(file.filename)[1] or ".jpg"
+    filename = f"user_{user.id}{ext}"
+    content_type = file.content_type or "image/jpeg"
+
+    # Upload to Firebase
+    public_url = upload_file_to_firebase(file_bytes, "uploads/avatars", filename, content_type)
     
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    user.profile_photo = file_path
+    user.profile_photo = public_url
     db.commit()
     
-    return {"profile_photo": file_path}
+    return {"profile_photo": public_url}
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -977,16 +1011,10 @@ async def submit_incident_report(
         if not description or not latitude or not longitude or not barangay:
             raise HTTPException(status_code=400, detail="Missing required fields")
         
-        IMAGE_DIR = "uploads/images"
-        VIDEO_DIR = "uploads/videos"
-        os.makedirs(IMAGE_DIR, exist_ok=True)
-        os.makedirs(VIDEO_DIR, exist_ok=True)
-        
-        # Store both relative (for frontend) and absolute (for ML) paths
-        image_paths = []       # relative URLs for frontend
-        video_paths = []       # relative URLs for frontend
-        image_abs_paths = []   # absolute paths for analysis
-        video_abs_paths = []   # absolute paths for analysis
+        # We'll store Firebase URLs and process ML via temp files
+        firebase_urls = []   # list of dicts with url and type
+        image_analysis_result = None
+        video_analysis_result = None
         
         # Find all file indices
         file_indices = set()
@@ -1009,74 +1037,34 @@ async def submit_incident_report(
             if file_type not in ["image", "video"]:
                 file_type = "image"
             
+            # Read bytes
+            file_bytes = await file_obj.read()  # async read
+            
+            # Determine extension and content type
             ext = os.path.splitext(file_obj.filename)[1]
             if not ext:
                 ext = ".jpg" if file_type == "image" else ".mp4"
-            # 👇 ADD THIS BLOCK
             if ext == ".jfif":
-                ext = ".jpg"   # Rename to .jpg since it's the same format
+                ext = ".jpg"
             filename = f"{uuid.uuid4()}{ext}"
+            content_type = file_obj.content_type or ("image/jpeg" if file_type == "image" else "video/mp4")
             
-            if file_type == "image":
-                rel_path = f"/{IMAGE_DIR}/{filename}"
-                abs_path = os.path.abspath(rel_path.lstrip('/'))  # convert to absolute
-                image_paths.append(rel_path)
-                image_abs_paths.append(abs_path)
-                with open(abs_path, "wb") as f:
-                    shutil.copyfileobj(file_obj.file, f)
-            else:
-                rel_path = f"/{VIDEO_DIR}/{filename}"
-                abs_path = os.path.abspath(rel_path.lstrip('/'))
-                video_paths.append(rel_path)
-                video_abs_paths.append(abs_path)
-                with open(abs_path, "wb") as f:
-                    shutil.copyfileobj(file_obj.file, f)
-        
-        # ========== ML PREDICTIONS ==========
-        text_pred = None
-        image_pred = None
-        video_pred = None
-        
-        try:
-            # 1. Text analysis (always works)
-            text_pred = predict_text(description)
-            print(f"✅ Text prediction: {text_pred}")
+            # 1️⃣ Upload to Firebase
+            folder = "uploads/images" if file_type == "image" else "uploads/videos"
+            public_url = upload_file_to_firebase(file_bytes, folder, filename, content_type)
+            firebase_urls.append({"url": public_url, "type": file_type})
             
-            # 2. Image analysis – use absolute path
-            if image_abs_paths:
-                first_abs = image_abs_paths[0]
-                print(f"📁 Analysing image: {first_abs} (exists: {os.path.exists(first_abs)})")
-                if os.path.exists(first_abs):
-                    image_pred = analyze_image(first_abs)
-                    print(f"✅ Image analysis result: {image_pred}")
-                else:
-                    print(f"❌ Image file not found at {first_abs}")
-            
-            # 3. Video analysis – use absolute path
-            if video_abs_paths:
-                first_vid_abs = video_abs_paths[0]
-                print(f"📁 Analysing video: {first_vid_abs} (exists: {os.path.exists(first_vid_abs)})")
-                if os.path.exists(first_vid_abs):
-                    video_pred = analyze_video(first_vid_abs)
-                    print(f"✅ Video analysis: {video_pred}")
-                else:
-                    print(f"❌ Video file not found at {first_vid_abs}")
+            # 2️⃣ Process with ML using a temporary file
+            with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
+                tmp.write(file_bytes)
+                tmp.flush()
+                if file_type == "image":
+                    image_analysis_result = analyze_image(tmp.name)
+                elif file_type == "video":
+                    video_analysis_result = analyze_video(tmp.name)
         
-        except Exception as e:
-            print(f"❌ ML prediction failed: {e}")
-            import traceback
-            traceback.print_exc()
-            # Fallback text (ensures at least text analysis exists)
-            text_pred = {
-                "incident_type": "Other",
-                "severity": "medium",
-                "type_confidence": 0.5,
-                "severity_confidence": 0.5,
-                "all_type_scores": {},
-                "all_severity_scores": {}
-            }
-            image_pred = None
-            video_pred = None
+        # ── Text analysis (no change) ──
+        text_pred = predict_text(description)
         
         # Build incident data
         report_data = {
@@ -1090,7 +1078,7 @@ async def submit_incident_report(
             "user_id": str(current_user.id)
         }
         
-        # Create incident with ML results
+        # Create incident with Firebase URLs (stored as list of strings)
         incident = crud_incidents.create_incident_report(
             db=db,
             user_id=current_user.id,
@@ -1102,10 +1090,10 @@ async def submit_incident_report(
                 "analysis": text_pred,
                 "recommendations": []
             },
-            image_paths=image_paths,
-            video_paths=video_paths,
-            image_analysis=image_pred,
-            video_analysis=video_pred,
+            image_paths=[f["url"] for f in firebase_urls if f["type"] == "image"],
+            video_paths=[f["url"] for f in firebase_urls if f["type"] == "video"],
+            image_analysis=image_analysis_result,
+            video_analysis=video_analysis_result,
             text_analysis=text_pred
         )
         
@@ -1126,8 +1114,8 @@ async def submit_incident_report(
             confidence=text_pred["type_confidence"],
             analysis={
                 "text_analysis": text_pred,
-                "image_analysis": image_pred,
-                "video_analysis": video_pred
+                "image_analysis": image_analysis_result,
+                "video_analysis": video_analysis_result
             },
             location={
                 "lat": latitude,
@@ -1631,20 +1619,14 @@ async def create_anonymous_emergency(
     if not audio.content_type.startswith('audio/'):
         raise HTTPException(status_code=400, detail="File must be an audio file")
 
-    # Generate a unique filename
+    # Read bytes
+    file_bytes = await audio.read()
     ext = os.path.splitext(audio.filename)[1] or '.webm'
     filename = f"{uuid.uuid4()}{ext}"
-    upload_dir = "uploads/emergencies"
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, filename)
+    content_type = audio.content_type or "audio/webm"
 
-    # Save the audio file
-    try:
-        contents = await audio.read()
-        with open(file_path, "wb") as f:
-            f.write(contents)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not save audio: {str(e)}")
+    # Upload to Firebase
+    public_url = upload_file_to_firebase(file_bytes, "uploads/emergencies", filename, content_type)
 
     # Get client IP (optional)
     client_ip = request.client.host if request.client else None
@@ -1653,20 +1635,17 @@ async def create_anonymous_emergency(
     emergency = models.AnonymousEmergency(
         latitude=lat,
         longitude=lng,
-        audio_path=file_path,
+        audio_path=public_url,   # store Firebase URL
         ip_address=client_ip
     )
     db.add(emergency)
     db.commit()
     db.refresh(emergency)
 
-    # Generate public URL for the audio file
-    audio_url = f"/uploads/emergencies/{filename}"
-
     return {
         "success": True,
         "id": emergency.id,
-        "audio_url": audio_url,
+        "audio_url": public_url,
         "timestamp": emergency.timestamp.isoformat()
     }
     
@@ -1834,7 +1813,7 @@ def upload_profile_avatar(
     credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer()),
     db: Session = Depends(get_db)
 ):
-    """Upload avatar image for the authenticated user."""
+    """Upload avatar image for the authenticated user using Firebase Storage."""
     payload = decode_token(credentials.credentials)
     user_id = int(payload.get("sub"))
     user = db.query(User).filter(User.id == user_id).first()
@@ -1845,17 +1824,19 @@ def upload_profile_avatar(
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image files are allowed")
     
-    ext = file.filename.split(".")[-1]
-    filename = f"user_{user.id}.{ext}"
-    file_path = f"{UPLOAD_DIR}/{filename}"
+    # Read bytes
+    file_bytes = file.file.read()
+    ext = os.path.splitext(file.filename)[1] or ".jpg"
+    filename = f"user_{user.id}{ext}"
+    content_type = file.content_type or "image/jpeg"
+
+    # Upload to Firebase
+    public_url = upload_file_to_firebase(file_bytes, "uploads/avatars", filename, content_type)
     
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    user.profile_photo = file_path
+    user.profile_photo = public_url
     db.commit()
     
-    return {"profile_photo": file_path}
+    return {"profile_photo": public_url}
 
 
 logging.basicConfig(level=logging.INFO)
