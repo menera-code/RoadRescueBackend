@@ -42,3 +42,4 @@ email-validator==2.2.0
 
 # If you use httpx (optional, but some code might)
 # httpx==0.28.1
+firebase-admin
