@@ -1,8 +1,3 @@
-# ==========================================
-# ROADRESCUE BACKEND - PRODUCTION REQUIREMENTS
-# For Render deployment (Python 3.11)
-# ==========================================
-
 # Core Web Framework
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
@@ -29,17 +24,15 @@ tenacity==8.5.0
 google-generativeai==0.8.3
 google-genai==1.2.0
 
-# Machine Learning Inference (Lazy-loaded)
+# Machine Learning (YOLO only – Lazy-loaded)
 torch==2.5.1
 ultralytics==8.3.47
-transformers==4.47.1
 opencv-python-headless==4.10.0.84
 Pillow==11.0.0
 numpy==1.26.4
 
-# Additional – if you use Pydantic EmailStr (schemas.py)
+# Additional
 email-validator==2.2.0
 
-# If you use httpx (optional, but some code might)
-# httpx==0.28.1
+# Firebase Admin
 firebase-admin
