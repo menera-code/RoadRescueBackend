@@ -90,7 +90,7 @@ app = FastAPI(title="RESQAPP API")
 # ========== CORS MIDDLEWARE ==========
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production!
+    allow_origins=["https://roadrescuefrontend.onrender.com"],  # ✅ your frontend domain  # Restrict in production!
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
