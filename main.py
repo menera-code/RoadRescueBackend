@@ -98,6 +98,17 @@ app.add_middleware(
     max_age=600,
 )
 
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    return JSONResponse(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
 # ========== FIREBASE INITIALIZATION ==========
 # For LOCAL testing, uncomment and set path to your downloaded JSON:
 # cred = credentials.Certificate("path/to/your-firebase-adminsdk.json")
@@ -264,13 +275,17 @@ def upload_avatar(
 async def unhandled_exception_handler(request: Request, exc: Exception):
     print("🔥 UNHANDLED ERROR:")
     traceback.print_exc()
-
     return JSONResponse(
         status_code=500,
         content={
             "error_type": exc.__class__.__name__,
             "detail": str(exc),
         },
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
     )
 
 @app.get("/health")
