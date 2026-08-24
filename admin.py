@@ -1054,10 +1054,6 @@ async def list_anonymous_emergencies(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500)
 ):
-    """
-    List all anonymous emergency alerts (no login required by user).
-    Accessible only to admins.
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -1068,9 +1064,8 @@ async def list_anonymous_emergencies(
 
     result = []
     for e in emergencies:
-        # Extract filename from stored path and build public URL
-        filename = os.path.basename(e.audio_path)
-        audio_url = f"/uploads/emergencies/{filename}"
+        # ✅ Use the stored Firebase URL directly
+        audio_url = e.audio_path
         result.append(AnonymousEmergencyResponse(
             id=e.id,
             latitude=e.latitude,
