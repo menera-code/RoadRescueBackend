@@ -730,7 +730,7 @@ async def get_analytics_data(
         IncidentReport.created_at < end
     )
 
-    # ---- All aggregations in SQL (same as before) ----
+    # ---- Aggregations ----
     type_rows = db.query(
         IncidentReport.incident_type,
         func.count(IncidentReport.id).label('cnt')
@@ -777,9 +777,10 @@ async def get_analytics_data(
      .group_by('hour').order_by('hour').all()
     hourlyDistribution = [{"hour": int(h), "count": cnt} for h, cnt in hourly_rows]
 
+    # ***** FIXED: correct timestampdiff *****
     avg_res = db.query(
         func.avg(
-            func.timestampdiff(func.hour, IncidentReport.created_at, IncidentReport.resolved_at)
+            func.timestampdiff('hour', IncidentReport.created_at, IncidentReport.resolved_at)
         )
     ).filter(
         base_filter,
@@ -789,7 +790,7 @@ async def get_analytics_data(
     ).scalar()
     avg_resolution = round(avg_res or 0, 2)
 
-    # ---- Barangay trends (today, week, month) ----
+    # ---- Barangay trends ----
     now = datetime.utcnow()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
@@ -818,7 +819,7 @@ async def get_analytics_data(
         for row in trend_rows
     ]
 
-    # ---- Vehicle types (fast: only fetch last 500 with analysis) ----
+    # ---- Vehicle types (limit to 500 for speed) ----
     from collections import defaultdict
     import json
 
@@ -831,7 +832,7 @@ async def get_analytics_data(
             IncidentReport.image_analysis.isnot(None),
             IncidentReport.text_analysis.isnot(None)
         )
-    ).limit(500).all()   # ← limit to 500 for speed
+    ).limit(500).all()
 
     vehicle_counts = defaultdict(int)
     for row in vehicle_rows:
@@ -870,11 +871,10 @@ async def get_analytics_data(
         "hourlyDistribution": hourlyDistribution,
         "weeklyTrend": weeklyTrend,
         "avgResolutionHours": avg_resolution,
-        "vehicleTypes": vehicle_types,      # ✅ Now included
+        "vehicleTypes": vehicle_types,
         "barangayTrends": barangay_trends,
     }
 
-    # Store in cache
     analytics_cache[cache_key] = result
     return result
 # ================= USER CREATION ENDPOINT =================
