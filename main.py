@@ -292,6 +292,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 def health():
     return {"ok": True}
 
+@app.head("/health")
+def health_head():
+    # HEAD requests should return the same headers as GET but NO body.
+    # Returning an empty response with status 200 is perfect.
+    return {"ok": True}  # FastAPI will strip the body automatically for HEAD
+
 @app.post("/auth/register", response_model=UserOut)
 def register(data: RegisterIn, db: Session = Depends(get_db)):
     if crud_users.get_user_by_email(db, data.email):
