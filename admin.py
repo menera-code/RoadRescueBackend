@@ -723,15 +723,14 @@ async def get_analytics_data(
     if cache_key in analytics_cache:
         return analytics_cache[cache_key]
 
-    from sqlalchemy import func, case, extract, and_
+    from sqlalchemy import func, case, extract, and_, or_
 
     base_filter = and_(
         IncidentReport.created_at >= start,
         IncidentReport.created_at < end
     )
 
-    # ---- All aggregations in SQL ----
-    # 1. By type
+    # ---- All aggregations in SQL (same as before) ----
     type_rows = db.query(
         IncidentReport.incident_type,
         func.count(IncidentReport.id).label('cnt')
@@ -739,7 +738,6 @@ async def get_analytics_data(
      .group_by(IncidentReport.incident_type).all()
     incidentsByType = [{"name": t or "Unknown", "count": cnt, "percentage": 0} for t, cnt in type_rows]
 
-    # 2. Severity distribution
     sev_rows = db.query(
         IncidentReport.severity,
         func.count(IncidentReport.id).label('cnt')
@@ -747,14 +745,12 @@ async def get_analytics_data(
      .group_by(IncidentReport.severity).all()
     severityDistribution = [{"level": s or "Unknown", "count": cnt} for s, cnt in sev_rows]
 
-    # 3. Daily activity
     daily_rows = db.query(
         func.date(IncidentReport.created_at).label('date'),
         func.count(IncidentReport.id).label('cnt')
     ).filter(base_filter).group_by('date').order_by('date').all()
     daily = [{"date": d.strftime("%Y-%m-%d"), "activity": cnt} for d, cnt in daily_rows]
 
-    # 4. Weekly trend (last 4 weeks)
     week_start = start - timedelta(days=start.weekday())
     weeklyTrend = []
     for i in range(4):
@@ -766,7 +762,6 @@ async def get_analytics_data(
         ).scalar() or 0
         weeklyTrend.append({"week": w_start.strftime("%Y-%m-%d"), "count": cnt})
 
-    # 5. Barangay distribution (top 10)
     barangay_rows = db.query(
         IncidentReport.barangay,
         func.count(IncidentReport.id).label('cnt')
@@ -775,7 +770,6 @@ async def get_analytics_data(
      .order_by(func.count(IncidentReport.id).desc()).limit(10).all()
     barangayDistribution = [{"barangay": b or "Unknown", "count": cnt} for b, cnt in barangay_rows]
 
-    # 6. Hourly distribution
     hourly_rows = db.query(
         extract('hour', IncidentReport.created_at).label('hour'),
         func.count(IncidentReport.id).label('cnt')
@@ -783,7 +777,6 @@ async def get_analytics_data(
      .group_by('hour').order_by('hour').all()
     hourlyDistribution = [{"hour": int(h), "count": cnt} for h, cnt in hourly_rows]
 
-    # 7. Average resolution time (hours)
     avg_res = db.query(
         func.avg(
             func.timestampdiff(func.hour, IncidentReport.created_at, IncidentReport.resolved_at)
@@ -796,7 +789,7 @@ async def get_analytics_data(
     ).scalar()
     avg_resolution = round(avg_res or 0, 2)
 
-    # ---- Barangay trends (today, week, month) in one query ----
+    # ---- Barangay trends (today, week, month) ----
     now = datetime.utcnow()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
@@ -825,7 +818,46 @@ async def get_analytics_data(
         for row in trend_rows
     ]
 
-    # Build result (vehicleTypes removed for speed)
+    # ---- Vehicle types (fast: only fetch last 500 with analysis) ----
+    from collections import defaultdict
+    import json
+
+    vehicle_rows = db.query(
+        IncidentReport.image_analysis,
+        IncidentReport.text_analysis
+    ).filter(
+        base_filter,
+        or_(
+            IncidentReport.image_analysis.isnot(None),
+            IncidentReport.text_analysis.isnot(None)
+        )
+    ).limit(500).all()   # ← limit to 500 for speed
+
+    vehicle_counts = defaultdict(int)
+    for row in vehicle_rows:
+        if row.image_analysis:
+            try:
+                img = json.loads(row.image_analysis)
+                vehicles = img.get('vehicles', {})
+                if isinstance(vehicles, dict):
+                    for v, count in vehicles.items():
+                        vehicle_counts[v] += count
+            except:
+                pass
+        if row.text_analysis:
+            try:
+                txt = json.loads(row.text_analysis)
+                mentioned = txt.get('mentioned_vehicles', [])
+                if isinstance(mentioned, list):
+                    for v in mentioned:
+                        vehicle_counts[v] += 1
+            except:
+                pass
+
+    vehicle_types = [{"type": k, "count": v} for k, v in vehicle_counts.items()]
+    vehicle_types.sort(key=lambda x: -x["count"])
+
+    # Build result
     result = {
         "incidentsByType": incidentsByType,
         "severityDistribution": severityDistribution,
@@ -838,7 +870,7 @@ async def get_analytics_data(
         "hourlyDistribution": hourlyDistribution,
         "weeklyTrend": weeklyTrend,
         "avgResolutionHours": avg_resolution,
-        "vehicleTypes": [],          # Removed to speed up
+        "vehicleTypes": vehicle_types,      # ✅ Now included
         "barangayTrends": barangay_trends,
     }
 
