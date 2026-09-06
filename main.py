@@ -1026,10 +1026,8 @@ async def submit_incident_report(
         if not description or not latitude or not longitude or not barangay:
             raise HTTPException(status_code=400, detail="Missing required fields")
         
-        # We'll store Firebase URLs and process ML via temp files
+        # ---- Upload files to Firebase (synchronous, but fast) ----
         firebase_urls = []   # list of dicts with url and type
-        image_analysis_result = None
-        video_analysis_result = None
         
         # Find all file indices
         file_indices = set()
@@ -1052,10 +1050,7 @@ async def submit_incident_report(
             if file_type not in ["image", "video"]:
                 file_type = "image"
             
-            # Read bytes
-            file_bytes = await file_obj.read()  # async read
-            
-            # Determine extension and content type
+            file_bytes = await file_obj.read()
             ext = os.path.splitext(file_obj.filename)[1]
             if not ext:
                 ext = ".jpg" if file_type == "image" else ".mp4"
@@ -1064,24 +1059,14 @@ async def submit_incident_report(
             filename = f"{uuid.uuid4()}{ext}"
             content_type = file_obj.content_type or ("image/jpeg" if file_type == "image" else "video/mp4")
             
-            # 1️⃣ Upload to Firebase
             folder = "uploads/images" if file_type == "image" else "uploads/videos"
             public_url = upload_file_to_firebase(file_bytes, folder, filename, content_type)
             firebase_urls.append({"url": public_url, "type": file_type})
-            
-            # 2️⃣ Process with ML using a temporary file
-            with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
-                tmp.write(file_bytes)
-                tmp.flush()
-                if file_type == "image":
-                    image_analysis_result = analyze_image(tmp.name)
-                elif file_type == "video":
-                    video_analysis_result = analyze_video(tmp.name)
         
-        # ── Text analysis (no change) ──
+        # ---- Text analysis (fast) ----
         text_pred = predict_text(description)
         
-        # Build incident data
+        # ---- Build incident data (no image/video ML yet) ----
         report_data = {
             "description": description,
             "latitude": latitude,
@@ -1093,7 +1078,7 @@ async def submit_incident_report(
             "user_id": str(current_user.id)
         }
         
-        # Create incident with Firebase URLs (stored as list of strings)
+        # Create incident with text analysis and media URLs (no image/video analysis yet)
         incident = crud_incidents.create_incident_report(
             db=db,
             user_id=current_user.id,
@@ -1107,20 +1092,21 @@ async def submit_incident_report(
             },
             image_paths=[f["url"] for f in firebase_urls if f["type"] == "image"],
             video_paths=[f["url"] for f in firebase_urls if f["type"] == "video"],
-            image_analysis=image_analysis_result,
-            video_analysis=video_analysis_result,
+            image_analysis=None,      # will be filled by background task
+            video_analysis=None,      # will be filled by background task
             text_analysis=text_pred
         )
         
-        # Background task (optional)
+        # ---- Schedule background ML processing for images/videos ----
         background_tasks.add_task(
-            process_incident_background,
+            process_media_analysis,
             incident.id,
-            text_pred,
+            firebase_urls,
+            db  # note: we pass the db session – careful with sessions in background tasks
         )
         
-        # Build response
-        response = MLReportAnalysisResponse(
+        # ---- Return immediately ----
+        return MLReportAnalysisResponse(
             success=True,
             report_id=incident.id,
             incident_type=text_pred["incident_type"],
@@ -1129,8 +1115,8 @@ async def submit_incident_report(
             confidence=text_pred["type_confidence"],
             analysis={
                 "text_analysis": text_pred,
-                "image_analysis": image_analysis_result,
-                "video_analysis": video_analysis_result
+                "image_analysis": None,
+                "video_analysis": None
             },
             location={
                 "lat": latitude,
@@ -1141,8 +1127,6 @@ async def submit_incident_report(
             recommendations=[],
             timestamp=datetime.utcnow().isoformat()
         )
-        
-        return response
     
     except HTTPException as he:
         raise he
@@ -1157,6 +1141,66 @@ async def submit_incident_report(
                 "detail": str(e)
             }
         )
+
+async def process_media_analysis(incident_id: str, firebase_urls: list, db: Session):
+    """
+    Background task: download media from Firebase, run ML analysis,
+    and update the incident record.
+    """
+    from services.predictor import analyze_image, analyze_video
+    import tempfile
+    import requests
+    
+    image_analysis_result = None
+    video_analysis_result = None
+    
+    for item in firebase_urls:
+        url = item["url"]
+        media_type = item["type"]
+        
+        # Download file from Firebase URL
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            content = response.content
+        except Exception as e:
+            print(f"❌ Failed to download {url}: {e}")
+            continue
+        
+        # Determine extension from URL or content-type
+        ext = os.path.splitext(url)[1]
+        if not ext:
+            ext = ".jpg" if media_type == "image" else ".mp4"
+        
+        # Write to temporary file
+        with tempfile.NamedTemporaryFile(delete=True, suffix=ext) as tmp:
+            tmp.write(content)
+            tmp.flush()
+            
+            if media_type == "image":
+                image_analysis_result = analyze_image(tmp.name)
+            elif media_type == "video":
+                video_analysis_result = analyze_video(tmp.name)
+    
+    # Update the incident record
+    # We need a fresh session because the original session is closed
+    from database import SessionLocal
+    db_local = SessionLocal()
+    try:
+        incident = db_local.query(IncidentReport).filter(IncidentReport.id == incident_id).first()
+        if incident:
+            if image_analysis_result:
+                incident.image_analysis = json.dumps(image_analysis_result)
+            if video_analysis_result:
+                incident.video_analysis = json.dumps(video_analysis_result)
+            db_local.commit()
+            print(f"✅ Background ML analysis completed for incident {incident_id}")
+    except Exception as e:
+        print(f"❌ Failed to update incident {incident_id} with ML results: {e}")
+        db_local.rollback()
+    finally:
+        db_local.close()
+        
 
 # ─── UPDATED: Text-only ML analysis using predictor ───
 @app.post("/api/ml/analyze-text", response_model=MLTextAnalysisResponse)
