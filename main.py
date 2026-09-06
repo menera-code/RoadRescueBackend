@@ -1233,13 +1233,24 @@ async def get_incidents(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """
-    Get incidents with optional filters
-    """
-    incidents = crud_incidents.get_all_incidents(
-        db, skip=skip, limit=limit, 
-        status=status, incident_type=type, barangay=barangay
-    )
+    query = db.query(IncidentReport)
+    
+    # 🔐 Responders only see approved incidents
+    if current_user.role == "responder":
+        query = query.filter(
+            IncidentReport.verified_by.isnot(None),
+            IncidentReport.status != "pending"
+        )
+    
+    if status:
+        query = query.filter(IncidentReport.status == status)
+    if type:
+        query = query.filter(IncidentReport.incident_type == type)
+    if barangay:
+        query = query.filter(IncidentReport.barangay == barangay)
+    
+    incidents = query.order_by(IncidentReport.created_at.desc())\
+                     .offset(skip).limit(limit).all()
     return incidents
 
 @app.get("/api/reports/my", response_model=List[IncidentReportResponse])

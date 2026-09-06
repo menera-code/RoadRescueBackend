@@ -6,11 +6,9 @@ from pydantic import BaseModel, EmailStr, validator
 from typing import Optional
 from datetime import datetime
 from models import ChatHistory
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, or_, case, extract
 from database import SessionLocal
 from datetime import datetime, timezone
-
-from cachetools import TTLCache
 
 from models import IncidentReport, ResponderResolvedIncident
 from datetime import datetime
@@ -21,7 +19,7 @@ from models import ResponderLocation, User
 from schemas import ResponderLocationUpdate, ResponderLocationResponse
 
 # ================= RESPONDER LOCATION TRACKING =================
-from models import ResponderLocation  # you'll need to create this model
+from models import ResponderLocation
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -30,22 +28,21 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from models import Alert, User
 from schemas import AlertCreate
-from deps import get_current_admin  # ensure only admin can post
+from deps import get_current_admin
 
 import os
 from models import AnonymousEmergency
 from schemas import AnonymousEmergencyResponse
 
 from deps import get_db, get_current_user
-from deps import get_current_user
 from models import User
 from schemas import (
     UserOut, UserProfileOut, AdminDashboardStats, 
     UserListResponse, UserRoleUpdate, UserStatusUpdate,
-    UserAdminUpdate, UserAdminCreate  # Add UserAdminCreate here
+    UserAdminUpdate, UserAdminCreate
 )
 import crud_users
-from security import hash_password  # Add this import
+from security import hash_password
 from fastapi import BackgroundTasks, HTTPException, Depends
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
@@ -53,8 +50,6 @@ from deps import get_current_user, get_db
 from models import User
 from sqlalchemy.orm import Session
 from ml_analytics import ml_analytics
-
-
 
 from models import LegalCompliance
 from schemas import LegalComplianceCreate, LegalComplianceUpdate, LegalComplianceResponse
@@ -64,13 +59,12 @@ from collections import Counter
 from datetime import datetime
 from fastapi import Query, HTTPException
 from sqlalchemy.orm import Session
-# ❌ Removed: import numpy as np
-# ❌ Removed: from sklearn.neighbors import KernelDensity
 import math
 from typing import Optional
 
-# Cache for analytics endpoint (TTL = 30 seconds)
-analytics_cache = TTLCache(maxsize=1, ttl=30)
+# ---------- CACHING FOR PERFORMANCE ----------
+from cachetools import TTLCache
+analytics_cache = TTLCache(maxsize=1, ttl=30)   # 30 seconds TTL
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -90,16 +84,13 @@ async def get_all_users(
     """
     Get all users with filters (Admin only)
     """
-    # Check if user is admin
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
-    # Get users with filters
     result = crud_users.get_all_users(
         db, skip=skip, limit=limit, 
         role=role, status=status, barangay=barangay, search=search
     )
-    
     return result
 
 @router.get("/users/{user_id}", response_model=UserProfileOut)
@@ -108,16 +99,11 @@ async def get_user_details(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get detailed user information (Admin only)
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     user = crud_users.get_user_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
     return user
 
 @router.put("/users/{user_id}/role")
@@ -127,25 +113,16 @@ async def update_user_role(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Update user role (Admin only)
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    # Validate role
     valid_roles = ["user", "admin", "responder", "tmo"]
     if role_data.role not in valid_roles:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {valid_roles}")
-    
-    # Check if trying to change own role
     if user_id == current_user.id and role_data.role != "admin":
         raise HTTPException(status_code=400, detail="Cannot change your own admin role")
-    
     user = crud_users.update_user_role(db, user_id, role_data.role)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
     return {"message": f"User role updated to {role_data.role}", "user": UserOut.from_orm(user)}
 
 @router.put("/users/{user_id}/status")
@@ -155,29 +132,19 @@ async def update_user_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Update user status (active/inactive) (Admin only)
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    # Validate status
     valid_statuses = ["active", "inactive", "suspended"]
     if status_data.status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {valid_statuses}")
-    
-    # Check if trying to change own status
     if user_id == current_user.id and status_data.status != "active":
         raise HTTPException(status_code=400, detail="Cannot deactivate/suspend your own account")
-    
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
     user.status = status_data.status
     db.commit()
     db.refresh(user)
-    
     return {"message": f"User status updated to {status_data.status}", "user": UserOut.from_orm(user)}
 
 @router.put("/users/{user_id}")
@@ -187,24 +154,16 @@ async def update_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Update user information (Admin only)
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # Update only provided fields
     update_data = user_data.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(user, field, value)
-    
     db.commit()
     db.refresh(user)
-    
     return {"message": "User updated successfully", "user": UserProfileOut.from_orm(user)}
 
 @router.delete("/users/{user_id}")
@@ -213,23 +172,15 @@ async def delete_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Delete a user (Admin only)
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    # Check if trying to delete own account
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
-    
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
     db.delete(user)
     db.commit()
-    
     return {"message": "User deleted successfully"}
 
 # ================= DASHBOARD STATISTICS ENDPOINTS =================
@@ -239,6 +190,10 @@ async def get_dashboard_stats(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """
+    Get dashboard statistics (Admin only)
+    Optimized with single SQL queries.
+    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
@@ -301,14 +256,9 @@ async def get_responders(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get all responders (Admin only)
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     responders = db.query(User).filter(User.role == "responder", User.status == "active").all()
-    
     return [
         {
             "id": user.id,
@@ -320,8 +270,6 @@ async def get_responders(
     ]
 
 # ================= INCIDENT MANAGEMENT ENDPOINTS =================
-from sqlalchemy.orm import Session
-from models import IncidentReport
 
 @router.get("/incidents")
 async def get_incidents(
@@ -330,15 +278,27 @@ async def get_incidents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """
+    Get incidents.
+    - Admin sees all.
+    - Responder sees only approved incidents (verified_by not None and status != 'pending').
+    """
     query = db.query(IncidentReport)
-    if assigned_to is not None:    
+    
+    # 🔐 Approval filter for responders
+    if current_user.role == "responder":
+        query = query.filter(
+            IncidentReport.verified_by.isnot(None),
+            IncidentReport.status != "pending"
+        )
+    
+    if assigned_to is not None:
         query = query.filter(IncidentReport.assigned_to == assigned_to)
     if status:
         query = query.filter(IncidentReport.status == status)
     
     incidents = query.all()
     
-    # Convert to list of dicts including media fields
     result = []
     for inc in incidents:
         result.append({
@@ -354,19 +314,19 @@ async def get_incidents(
             "emergency_contact": inc.emergency_contact,
             "latitude": inc.latitude,
             "longitude": inc.longitude,
-            "image_paths": inc.image_paths,   # ← JSON string
-            "video_paths": inc.video_paths,   # ← JSON string
+            "image_paths": inc.image_paths,
+            "video_paths": inc.video_paths,
             "text_analysis": inc.text_analysis,
             "created_at": inc.created_at,
             "resolved_at": inc.resolved_at,
-            "assigned_to": inc.assigned_to,   # ✅ Ensure this field is included
+            "assigned_to": inc.assigned_to,
             "user": {
                 "full_name": inc.reporter.full_name if inc.reporter else None
             } if inc.reporter else None
         })
     return result
 
-# ================= HEATMAP ENDPOINT (must come before /incidents/{incident_id}) =================
+# ================= HEATMAP ENDPOINT =================
 @router.get("/incidents/heatmap")
 async def get_heatmap_data(
     days: int = Query(30, ge=1, le=365),
@@ -376,10 +336,7 @@ async def get_heatmap_data(
 ):
     if current_user.role not in ["admin", "responder"]:
         raise HTTPException(status_code=403, detail="Admin or responder access required")
-
-    from datetime import datetime, timedelta
     cutoff_date = datetime.utcnow() - timedelta(days=days)
-    
     query = db.query(IncidentReport).filter(
         IncidentReport.created_at >= cutoff_date,
         IncidentReport.latitude.isnot(None),
@@ -387,10 +344,7 @@ async def get_heatmap_data(
     )
     if status and status != "all":
         query = query.filter(IncidentReport.status == status)
-    
     incidents = query.all()
-    
-    # Return empty list if none, but still 200 OK
     return [
         {
             "id": inc.id,
@@ -405,22 +359,18 @@ async def get_heatmap_data(
         for inc in incidents
     ]
 
-
-
+# ================= HELPER FUNCTIONS =================
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371000  # meters
+    R = 6371000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-
 def get_closest_responder(incident_lat: float, incident_lon: float, db: Session) -> Optional[int]:
     from datetime import datetime, timedelta
     cutoff = datetime.utcnow() - timedelta(minutes=60)
-
-    # 1. Fresh locations (last 60 min)
     fresh = db.query(ResponderLocation).join(
         User, ResponderLocation.responder_id == User.id
     ).filter(
@@ -428,30 +378,23 @@ def get_closest_responder(incident_lat: float, incident_lon: float, db: Session)
         User.status == "active",
         ResponderLocation.updated_at >= cutoff
     ).all()
-
     if fresh:
         closest = min(fresh, key=lambda r: haversine(incident_lat, incident_lon, r.latitude, r.longitude))
         return closest.responder_id
-
-    # 2. Any location (stale)
     stale = db.query(ResponderLocation).join(
         User, ResponderLocation.responder_id == User.id
     ).filter(
         User.role == "responder",
         User.status == "active"
     ).all()
-
     if stale:
         closest = min(stale, key=lambda r: haversine(incident_lat, incident_lon, r.latitude, r.longitude))
         return closest.responder_id
-
-    # 3. Fallback: any active responder
     any_responder = db.query(User).filter(
         User.role == "responder",
         User.status == "active"
     ).first()
     return any_responder.id if any_responder else None
-
 
 def assign_closest_responder(incident: IncidentReport, admin_user: User, db: Session) -> str:
     if incident.latitude is None or incident.longitude is None:
@@ -459,9 +402,7 @@ def assign_closest_responder(incident: IncidentReport, admin_user: User, db: Ses
     responder_id = get_closest_responder(incident.latitude, incident.longitude, db)
     if responder_id is None:
         return "No active responder available."
-    # Use the existing assign function
     return assign_incident_to_responder(incident, responder_id, admin_user, db)
-
 
 def assign_incident_to_responder(
     incident: IncidentReport,
@@ -469,7 +410,6 @@ def assign_incident_to_responder(
     admin_user: User,
     db: Session
 ) -> str:
-    """Assign or unassign an incident. Returns a message."""
     from models import IncidentAssignmentLog
     previous = incident.assigned_to
     if responder_id is not None:
@@ -483,7 +423,6 @@ def assign_incident_to_responder(
         incident.assigned_to = None
         action = "unassign"
         msg = "Unassigned"
-
     incident.updated_at = datetime.utcnow()
     log = IncidentAssignmentLog(
         incident_id=incident.id,
@@ -495,29 +434,22 @@ def assign_incident_to_responder(
     db.commit()
     return msg
 
-# ================= DYNAMIC INCIDENT DETAILS (after static routes) =================
+# ================= DYNAMIC INCIDENT DETAILS =================
 @router.get("/incidents/{incident_id}")
 async def get_incident_details(
     incident_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get incident details (Admin only)
-    """
     if current_user.role not in ["admin", "responder"]:
         raise HTTPException(status_code=403, detail="Admin/responder access required")
-    
     from models import IncidentReport
     from sqlalchemy.orm import joinedload
-    
     incident = db.query(IncidentReport).options(
         joinedload(IncidentReport.reporter)
     ).filter(IncidentReport.id == incident_id).first()
-    
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-    
     return {
         "id": incident.id,
         "description": incident.description,
@@ -553,22 +485,16 @@ async def update_incident_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Your existing permission checks...
     incident = db.query(IncidentReport).filter(IncidentReport.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-    
-    # Only admin or assigned responder can update
     if current_user.role != "admin" and incident.assigned_to != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
     old_status = incident.status
     incident.status = status
     if status == "resolved" and not incident.resolved_at:
         incident.resolved_at = datetime.utcnow()
     db.add(incident)
-    
-    # ** ADD THIS BLOCK **
     if status == "resolved" and current_user.role == "responder" and old_status != "resolved":
         resolved_log = ResponderResolvedIncident(
             incident_id=incident_id,
@@ -577,7 +503,6 @@ async def update_incident_status(
             notes=f"Resolved by {current_user.full_name}"
         )
         db.add(resolved_log)
-    
     db.commit()
     return {"success": True, "message": f"Status updated to {status}"}
 
@@ -591,27 +516,20 @@ async def assign_incident_to_responder(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-
     incident = db.query(IncidentReport).filter(IncidentReport.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-
-    # Use the helper that does the actual assignment
     assign_incident_to_responder_helper(incident, responder_id, current_user, db)
-    
-    # Ensure the incident is refreshed
     db.refresh(incident)
     return {"message": "Assignment updated", "incident_id": incident_id, "assigned_to": incident.assigned_to}
-# ================= ANALYTICS ENDPOINTS =================
+
 def assign_incident_to_responder_helper(
     incident: IncidentReport,
     responder_id: Optional[int],
     admin_user: User,
     db: Session
 ) -> str:
-    """Assign or unassign an incident. Returns a message."""
     from models import IncidentAssignmentLog
-
     previous = incident.assigned_to
     if responder_id is not None:
         responder = db.query(User).filter(User.id == responder_id, User.role == "responder").first()
@@ -624,7 +542,6 @@ def assign_incident_to_responder_helper(
         incident.assigned_to = None
         action = "unassign"
         msg = "Unassigned"
-
     incident.updated_at = datetime.utcnow()
     log = IncidentAssignmentLog(
         incident_id=incident.id,
@@ -635,60 +552,8 @@ def assign_incident_to_responder_helper(
     db.add(log)
     db.commit()
     return msg
-# ================= ML ANALYTICS ENDPOINTS =================
 
-from ml_analytics import ml_analytics
-from schemas import MLAnalyticsResponse, ModelPerformanceResponse, DatasetStatusResponse, MLStatsSummaryResponse
-from deps import get_current_admin
-from fastapi import Query
-from typing import Optional
-
-@router.get("/ml-analytics/{user_id}", response_model=MLAnalyticsResponse)
-async def get_ml_analytics(
-    user_id: int,
-    days: int = Query(30, ge=1, le=365),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_admin)
-):
-    """
-    Get ML analytics for specific user (Admin only)
-    """
-    stats = ml_analytics.get_user_ml_stats(user_id, days, db)
-    return MLAnalyticsResponse(**stats)
-
-# ── Unified ML performance endpoints (only one set) ──
-
-@router.get("/ml-performance")
-async def admin_ml_performance(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Return model performance metrics (accuracy, version, etc.)"""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    return ml_analytics.get_model_performance(db)
-
-@router.get("/dataset-status")
-async def admin_dataset_status(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Return storage info and training dataset counts"""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    return ml_analytics.get_dataset_status(db)
-
-@router.get("/ml-stats-summary")
-async def admin_ml_stats_summary(
-    days: int = 30,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Return summary stats (total predictions, avg confidence, by type, by severity)"""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    return ml_analytics.get_training_stats(days, db)
-
+# ================= ANALYTICS ENDPOINT (OPTIMIZED + CACHED) =================
 @router.get("/analytics")
 async def get_analytics_data(
     start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
@@ -696,10 +561,15 @@ async def get_analytics_data(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    """
+    Enhanced analytics with date filtering, hourly, weekly, barangay,
+    resolution time, vehicle types (limited to 500 records for speed),
+    and barangay trends. Cached for 30 seconds.
+    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    # Parse dates, default last 30 days
+
+    # Parse dates
     if start_date:
         try:
             start = datetime.strptime(start_date, "%Y-%m-%d")
@@ -715,8 +585,7 @@ async def get_analytics_data(
             raise HTTPException(status_code=400, detail="Invalid end_date format")
     else:
         end = datetime.utcnow()
-
-    end = end + timedelta(days=1)  # inclusive end
+    end = end + timedelta(days=1)
 
     # Cache key
     cache_key = f"analytics_{start.isoformat()}_{end.isoformat()}"
@@ -730,7 +599,7 @@ async def get_analytics_data(
         IncidentReport.created_at < end
     )
 
-    # ---- Aggregations ----
+    # ---- All aggregations in SQL ----
     type_rows = db.query(
         IncidentReport.incident_type,
         func.count(IncidentReport.id).label('cnt')
@@ -777,7 +646,7 @@ async def get_analytics_data(
      .group_by('hour').order_by('hour').all()
     hourlyDistribution = [{"hour": int(h), "count": cnt} for h, cnt in hourly_rows]
 
-    # ***** FIXED: correct timestampdiff *****
+    # Average resolution time (hours)
     avg_res = db.query(
         func.avg(
             func.timestampdiff('hour', IncidentReport.created_at, IncidentReport.resolved_at)
@@ -790,7 +659,7 @@ async def get_analytics_data(
     ).scalar()
     avg_resolution = round(avg_res or 0, 2)
 
-    # ---- Barangay trends ----
+    # ---- Barangay trends (today, week, month) in one query ----
     now = datetime.utcnow()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
@@ -819,7 +688,7 @@ async def get_analytics_data(
         for row in trend_rows
     ]
 
-    # ---- Vehicle types (limit to 500 for speed) ----
+    # ---- Vehicle types (fast: only fetch last 500 with analysis) ----
     from collections import defaultdict
     import json
 
@@ -858,7 +727,7 @@ async def get_analytics_data(
     vehicle_types = [{"type": k, "count": v} for k, v in vehicle_counts.items()]
     vehicle_types.sort(key=lambda x: -x["count"])
 
-    # Build result
+    # Build final response
     result = {
         "incidentsByType": incidentsByType,
         "severityDistribution": severityDistribution,
@@ -875,34 +744,24 @@ async def get_analytics_data(
         "barangayTrends": barangay_trends,
     }
 
+    # Store in cache
     analytics_cache[cache_key] = result
     return result
-# ================= USER CREATION ENDPOINT =================
 
+# ================= USER CREATION ENDPOINT =================
 @router.post("/users", response_model=UserProfileOut)
 async def create_user_admin(
     user_data: UserAdminCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Create a new user (Admin only)
-    """
-    # Check if user is admin
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    # Check if email already exists
     existing_user = crud_users.get_user_by_email(db, user_data.email)
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
-    
-    # Create user using crud function
     user_dict = user_data.dict(exclude={'send_welcome_email'})
-    
-    # Create user
     user = crud_users.create_user_admin(db, user_dict)
-    
     return user
 
 @router.get("/barangays")
@@ -910,23 +769,14 @@ async def get_barangays(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get list of barangays for dropdown (Admin only)
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    # Get unique barangays from users
     from sqlalchemy import distinct
     barangays = db.query(distinct(User.barangay)).filter(
         User.barangay.isnot(None),
         User.barangay != ''
     ).order_by(User.barangay).all()
-    
-    # Extract barangay names
     barangay_list = [barangay[0] for barangay in barangays]
-    
-    # If no barangays found, return default list
     if not barangay_list:
         barangay_list = [
             "Bayanan I", "Bayanan II", "Calero", "Camilmil",
@@ -941,32 +791,22 @@ async def get_barangays(
             "Sapul", "Silonay", "Suqui", "Tawagan",
             "Tawiran", "Tibag", "Wawa"
         ]
-    
     return {"barangays": barangay_list}
 
 # ================= ADMIN CHAT ENDPOINTS =================
-
 @router.get("/chats")
 async def get_chat_list(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get list of users with chat history, including last message and timestamp.
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     from models import ChatHistory
     from sqlalchemy import func, and_
-    
-    # Subquery: latest message timestamp per user
     subq = db.query(
         ChatHistory.user_id,
         func.max(ChatHistory.created_at).label('last_activity')
     ).group_by(ChatHistory.user_id).subquery()
-    
-    # Get the actual last message for each user
     last_msgs = db.query(
         ChatHistory.user_id,
         ChatHistory.message,
@@ -978,12 +818,9 @@ async def get_chat_list(
             ChatHistory.created_at == subq.c.last_activity
         )
     ).all()
-    
-    # Fetch user details
     user_ids = [msg.user_id for msg in last_msgs]
     users = db.query(User).filter(User.id.in_(user_ids)).all()
     user_dict = {u.id: u for u in users}
-    
     result = []
     for msg in last_msgs:
         user = user_dict.get(msg.user_id)
@@ -995,8 +832,6 @@ async def get_chat_list(
                 "last_activity": msg.created_at.isoformat(),
                 "avatar": user.profile_photo
             })
-    
-    # Optional: sort by last_activity descending
     result.sort(key=lambda x: x["last_activity"], reverse=True)
     return result
 
@@ -1007,18 +842,12 @@ async def get_user_chat_messages(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get all messages (user + assistant) for a specific user.
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     from models import ChatHistory
-    
     messages = db.query(ChatHistory).filter(
         ChatHistory.user_id == user_id
     ).order_by(ChatHistory.created_at.asc()).limit(limit).all()
-    
     return [
         {
             "role": msg.role,
@@ -1032,20 +861,14 @@ async def get_user_chat_messages(
 @router.post("/chats/{user_id}/message")
 async def send_admin_message(
     user_id: int,
-    message_data: dict,  # expects {"message": "text"}
+    message_data: dict,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Send a message as admin to a user's chat. The message is stored as an
-    assistant message with metadata indicating it came from admin.
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     from models import ChatHistory
     import json
-    
     new_msg = ChatHistory(
         user_id=user_id,
         role="assistant",
@@ -1055,7 +878,6 @@ async def send_admin_message(
     db.add(new_msg)
     db.commit()
     db.refresh(new_msg)
-    
     return {
         "role": new_msg.role,
         "message": new_msg.message,
@@ -1072,15 +894,12 @@ async def list_anonymous_emergencies(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-
     emergencies = db.query(AnonymousEmergency)\
                     .order_by(AnonymousEmergency.timestamp.desc())\
                     .offset(skip).limit(limit)\
                     .all()
-
     result = []
     for e in emergencies:
-        # ✅ Use the stored Firebase URL directly
         audio_url = e.audio_path
         result.append(AnonymousEmergencyResponse(
             id=e.id,
@@ -1103,8 +922,8 @@ def broadcast_alert(
     print("  severity:", alert_data.severity)
     print("  geometry:", alert_data.geometry)
     print("  type(geometry):", type(alert_data.geometry))
-    print("  target_zone:", alert_data.target_zone)      # ✅ snake_case
-    print("  target_roles:", alert_data.target_roles)    # ✅ snake_case
+    print("  target_zone:", alert_data.target_zone)
+    print("  target_roles:", alert_data.target_roles)
 
     new_alert = Alert(
         message=alert_data.message,
@@ -1125,7 +944,6 @@ def broadcast_alert(
     except Exception as e:
         print("!!! Database error:", e)
         raise
-
     return {"success": True, "alert_id": new_alert.id}
 
 import json
@@ -1137,52 +955,37 @@ from fastapi import Form, UploadFile, File
 async def broadcast_alert_with_image(
     message: str = Form(...),
     severity: str = Form("medium"),
-    geometry: Optional[str] = Form(None),   # GeoJSON as JSON string
-    expires_at: Optional[str] = Form(None),   # ISO string from frontend
+    geometry: Optional[str] = Form(None),
+    expires_at: Optional[str] = Form(None),
     image: UploadFile = File(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_admin)
 ):
-
-    # Parse expires_at if provided
     expiration = None
     if expires_at:
         try:
             expiration = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid expires_at format")
-
-    # Parse geometry if provided
     geom_dict = None
     if geometry:
         try:
             geom_dict = json.loads(geometry)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid geometry JSON")
-
-    # Handle image upload
     image_url = None
     if image:
         if not image.content_type.startswith('image/'):
             raise HTTPException(status_code=400, detail="File must be an image")
-        
-        # Create upload directory if not exists
         upload_dir = "uploads/alerts"
         os.makedirs(upload_dir, exist_ok=True)
-        
-        # Generate unique filename
         ext = os.path.splitext(image.filename)[1] or '.jpg'
         filename = f"alert_{uuid.uuid4()}{ext}"
         file_path = os.path.join(upload_dir, filename)
-        
-        # Save file
         contents = await image.read()
         with open(file_path, "wb") as f:
             f.write(contents)
-        
         image_url = f"/uploads/alerts/{filename}"
-
-    # Create alert record
     new_alert = Alert(
         message=message,
         severity=severity,
@@ -1190,12 +993,10 @@ async def broadcast_alert_with_image(
         image_url=image_url,
         created_by=current_user.id,
         expires_at=expiration
-
     )
     db.add(new_alert)
     db.commit()
     db.refresh(new_alert)
-
     return {"success": True, "alert_id": new_alert.id}
 
 from pydantic import BaseModel
@@ -1204,7 +1005,7 @@ class AlertUpdate(BaseModel):
     message: Optional[str] = None
     severity: Optional[str] = None
     geometry: Optional[dict] = None
-    image_url: Optional[str] = None   # not for direct update, but if we allow image change
+    image_url: Optional[str] = None
 
 @router.get("/alerts")
 def get_all_alerts(
@@ -1216,7 +1017,6 @@ def get_all_alerts(
 ):
     query = db.query(Alert)
     if not include_expired:
-        # Show only alerts that have no expiration date OR expiration is in the future
         query = query.filter(
             (Alert.expires_at == None) | (Alert.expires_at > datetime.utcnow())
         )
@@ -1244,11 +1044,9 @@ def update_alert(
     alert = db.query(Alert).filter(Alert.id == alert_id).first()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-    
     update_data = alert_data.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(alert, field, value)
-    
     db.commit()
     db.refresh(alert)
     return alert
@@ -1262,38 +1060,22 @@ def delete_alert(
     alert = db.query(Alert).filter(Alert.id == alert_id).first()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-    
-    # Optionally delete image file
     if alert.image_url:
         file_path = alert.image_url.lstrip('/')
         if os.path.exists(file_path):
             os.remove(file_path)
-    
     db.delete(alert)
     db.commit()
     return {"message": "Alert deleted"}
-
-
-# ─── The following three endpoints already exist above; they are duplicates.
-# I'm removing them to avoid conflicts. Keep the ones above.
-
-# @router.get("/ml-performance")
-# ...
-# @router.get("/dataset-status")
-# ...
-# @router.get("/ml-stats-summary")
-# ...
 
 @router.get("/training-data-status")
 async def admin_training_data_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Return counts of verified and used training samples"""
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
     return ml_analytics.get_training_data_status(db)
-
 
 @router.post("/ml/train")
 async def start_training(
@@ -1313,13 +1095,9 @@ async def verify_report(
 ):
     if current_user.role not in ["admin", "responder"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-
-    # Get the original incident
     incident = db.query(IncidentReport).filter(IncidentReport.id == report_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-
-    # Check if already in training_datasets
     existing = db.query(TrainingDataset).filter(TrainingDataset.report_id == report_id).first()
     if not existing:
         training = TrainingDataset(
@@ -1342,15 +1120,11 @@ async def verify_report(
         existing.is_verified = True
         existing.verified_by = current_user.id
         existing.used_in_training = False
-
-    # Optionally update the incident's status or type
     incident.incident_type = corrected_type
     incident.severity = corrected_severity
-    incident.status = "verified"  # or whatever you prefer
-
+    incident.status = "verified"
     db.commit()
     return {"success": True, "message": "Report verified and added to training data"}
-
 
 @router.get("/training-data-status")
 async def training_data_status(
@@ -1361,6 +1135,7 @@ async def training_data_status(
         raise HTTPException(status_code=403, detail="Admin only")
     return ml_analytics.get_training_data_status(db)
 
+# ================= APPROVAL ENDPOINT (SETS verified_by) =================
 @router.post("/incidents/{incident_id}/approve")
 async def approve_incident(
     incident_id: str,
@@ -1374,34 +1149,33 @@ async def approve_incident(
     if not incident:
         raise HTTPException(404, "Incident not found")
 
+    # Mark as approved
     incident.status = "in-progress"
+    incident.verified_by = current_user.id   # ✅ set approver
     incident.updated_at = datetime.utcnow()
     db.commit()  # commit status change first
 
+    # Auto-assign if not already assigned
     if incident.assigned_to is None:
         msg = assign_closest_responder(incident, current_user, db)
-        # log or notify
+        # Optionally log the auto-assignment message
     return {"message": "Incident approved and marked in-progress"}
 
+# ================= DELETE INCIDENT =================
 @router.delete("/incidents/{incident_id}")
 async def delete_incident(
     incident_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Permanently delete an incident (Admin only)"""
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     from models import IncidentReport
-    
     incident = db.query(IncidentReport).filter(IncidentReport.id == incident_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
-    
     db.delete(incident)
     db.commit()
-    
     return {"message": "Incident deleted successfully"}
 
 @router.get("/incidents/{incident_id}/assignments")
@@ -1412,13 +1186,10 @@ async def get_incident_assignment_history(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     from models import IncidentAssignmentLog, User
-    
     logs = db.query(IncidentAssignmentLog).filter(
         IncidentAssignmentLog.incident_id == incident_id
     ).order_by(IncidentAssignmentLog.created_at.desc()).all()
-    
     result = []
     for log in logs:
         assigner = db.query(User).filter(User.id == log.assigned_by).first()
@@ -1446,13 +1217,12 @@ async def update_responder_location(
 ):
     if current_user.role != "responder":
         raise HTTPException(status_code=403, detail="Only responders can update location")
-    
     existing = db.query(ResponderLocation).filter(ResponderLocation.responder_id == current_user.id).first()
     if existing:
         existing.latitude = location.lat
         existing.longitude = location.lng
         existing.accuracy = location.accuracy
-        existing.updated_at = datetime.utcnow()   # <-- this works fine
+        existing.updated_at = datetime.utcnow()
     else:
         new_loc = ResponderLocation(
             responder_id=current_user.id,
@@ -1472,11 +1242,9 @@ async def get_responder_locations(
 ):
     if current_user.role not in ["admin", "responder"]:
         raise HTTPException(status_code=403, detail="Admin or responder access required")
-
     results = db.query(ResponderLocation, User.full_name).join(
         User, ResponderLocation.responder_id == User.id
     ).filter(User.role == "responder").all()
-    
     return [
         ResponderLocationResponse(
             responder_id=loc.responder_id,
@@ -1490,7 +1258,6 @@ async def get_responder_locations(
     ]
 
 # ================= LEGAL COMPLIANCE ENDPOINTS =================
-
 @router.get("/legal-compliances", response_model=List[LegalComplianceResponse])
 async def get_legal_compliances(
     category: Optional[str] = None,
@@ -1500,15 +1267,12 @@ async def get_legal_compliances(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     query = db.query(LegalCompliance)
     if category:
         query = query.filter(LegalCompliance.category == category)
     if is_active is not None:
         query = query.filter(LegalCompliance.is_active == is_active)
-    
     return query.order_by(LegalCompliance.created_at.desc()).all()
-
 
 @router.post("/legal-compliances", response_model=LegalComplianceResponse)
 async def create_legal_compliance(
@@ -1518,13 +1282,11 @@ async def create_legal_compliance(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     entry = LegalCompliance(**data.dict(), created_by=current_user.id)
     db.add(entry)
     db.commit()
     db.refresh(entry)
     return entry
-
 
 @router.put("/legal-compliances/{entry_id}", response_model=LegalComplianceResponse)
 async def update_legal_compliance(
@@ -1535,19 +1297,15 @@ async def update_legal_compliance(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     entry = db.query(LegalCompliance).filter(LegalCompliance.id == entry_id).first()
     if not entry:
         raise HTTPException(status_code=404, detail="Entry not found")
-    
     for field, value in data.dict(exclude_unset=True).items():
         setattr(entry, field, value)
-    
     entry.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(entry)
     return entry
-
 
 @router.delete("/legal-compliances/{entry_id}")
 async def delete_legal_compliance(
@@ -1557,11 +1315,9 @@ async def delete_legal_compliance(
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
-    
     entry = db.query(LegalCompliance).filter(LegalCompliance.id == entry_id).first()
     if not entry:
         raise HTTPException(status_code=404, detail="Entry not found")
-    
     db.delete(entry)
     db.commit()
     return {"message": "Legal compliance entry deleted"}
@@ -1570,18 +1326,15 @@ async def delete_legal_compliance(
 def get_media_analysis(
     incident_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)   # ← now uses current user (not admin)
+    current_user: User = Depends(get_current_user)
 ):
     incident = crud_incidents.get_incident_report(db, incident_id)
     if not incident:
         raise HTTPException(404, "Incident not found")
-    
-    # ✅ Allow: admin, the reporter (user_id), or the assigned responder (assigned_to)
     if current_user.role != "admin" and \
        current_user.id != incident.user_id and \
        current_user.id != incident.assigned_to:
         raise HTTPException(403, "Not authorized to view this report's analysis")
-    
     return {
         "text_analysis": json.loads(incident.text_analysis) if incident.text_analysis else None,
         "image_analysis": json.loads(incident.image_analysis) if incident.image_analysis else None,
@@ -1619,26 +1372,20 @@ def predict_hotspots(
     db: Session = Depends(get_db),
     current_admin: User = Depends(get_current_admin)
 ):
-    # ✅ Lazy‑load heavy libraries only when this endpoint is called
     try:
         from sklearn.neighbors import KernelDensity
         import numpy as np
     except ImportError:
         raise HTTPException(500, "scikit-learn or numpy not installed")
-
     incidents = db.query(IncidentReport).filter(
         IncidentReport.created_at >= start_date,
         IncidentReport.created_at <= end_date,
         IncidentReport.latitude.isnot(None),
         IncidentReport.longitude.isnot(None)
     ).all()
-
     if len(incidents) < 3:
         return {"type": "FeatureCollection", "features": [], "message": "Not enough data"}
-
     coords = np.radians([[i.latitude, i.longitude] for i in incidents])
-    
-    # Fallback: if only few points, just return those points as hotspots
     if len(coords) < 5:
         features = []
         for inc in incidents:
@@ -1648,19 +1395,14 @@ def predict_hotspots(
                 "properties": {"intensity": 0.8}
             })
         return {"type": "FeatureCollection", "features": features}
-
-    # Use KDE only if enough points
     kde = KernelDensity(bandwidth=0.01, metric='haversine')
     kde.fit(coords)
-
-    # Grid over Calapan area (adjust bounds as needed)
     lat_grid = np.linspace(13.35, 13.45, 30)
     lng_grid = np.linspace(121.13, 121.23, 30)
     points = np.array([[lat, lng] for lat in lat_grid for lng in lng_grid])
     points_rad = np.radians(points)
     densities = np.exp(kde.score_samples(points_rad))
     densities = densities / densities.max() if densities.max() > 0 else densities
-
     features = []
     for i, (lat, lng) in enumerate(points):
         if densities[i] > 0.1:
@@ -1671,6 +1413,7 @@ def predict_hotspots(
             })
     return {"type": "FeatureCollection", "features": features}
 
+# ================= AUTO-ASSIGN (ONLY FOR APPROVED INCIDENTS) =================
 @router.post("/incidents/auto-assign")
 async def auto_assign_all_incidents(
     db: Session = Depends(get_db),
@@ -1679,7 +1422,6 @@ async def auto_assign_all_incidents(
     if current_user.role != "admin":
         raise HTTPException(403, "Admin access required")
 
-    # 1. Get all active responders
     active_responders = db.query(User).filter(
         User.role == "responder",
         User.status == "active"
@@ -1687,7 +1429,6 @@ async def auto_assign_all_incidents(
     if not active_responders:
         return {"assigned": 0, "total_unassigned": 0, "errors": ["No active responders available"]}
 
-    # 2. Current assignment counts and locations
     responder_counts = {}
     responder_locations = {}
     for resp in active_responders:
@@ -1701,10 +1442,11 @@ async def auto_assign_all_incidents(
         ).order_by(ResponderLocation.updated_at.desc()).first()
         responder_locations[resp.id] = loc
 
-    # 3. Unassigned incidents (oldest first)
+    # 🔐 Only unassigned incidents that are APPROVED (in-progress AND verified_by not None)
     unassigned = db.query(IncidentReport).filter(
         IncidentReport.assigned_to.is_(None),
-        IncidentReport.status.in_(["pending", "in-progress"]),
+        IncidentReport.status == "in-progress",
+        IncidentReport.verified_by.isnot(None),   # Must be approved
         IncidentReport.latitude.isnot(None),
         IncidentReport.longitude.isnot(None)
     ).order_by(IncidentReport.created_at.asc()).all()
@@ -1716,7 +1458,6 @@ async def auto_assign_all_incidents(
     for inc in unassigned:
         best_responder_id = None
         best_score = None
-
         for resp in active_responders:
             loc = responder_locations.get(resp.id)
             if loc:
@@ -1727,16 +1468,13 @@ async def auto_assign_all_incidents(
             if best_score is None or score < best_score:
                 best_score = score
                 best_responder_id = resp.id
-
         if best_responder_id is None:
             errors.append(f"No suitable responder for incident {inc.id}")
             continue
 
-        # ✅ Perform assignment with immediate commit
         try:
             inc.assigned_to = best_responder_id
             inc.updated_at = datetime.utcnow()
-            
             log = IncidentAssignmentLog(
                 incident_id=inc.id,
                 assigned_by=current_user.id,
@@ -1744,9 +1482,8 @@ async def auto_assign_all_incidents(
                 action="assign"
             )
             db.add(log)
-            db.commit()          # <-- commit now
-            db.refresh(inc)      # <-- refresh to get latest data
-
+            db.commit()
+            db.refresh(inc)
             assigned_count += 1
             assignments.append({"incident_id": inc.id, "assigned_to": best_responder_id})
             responder_counts[best_responder_id] += 1
@@ -1772,6 +1509,9 @@ async def auto_assign_single_incident(
         raise HTTPException(404, "Incident not found")
     if incident.assigned_to is not None:
         return {"message": "Already assigned", "assigned_to": incident.assigned_to}
+    # 🔐 Must be approved
+    if incident.verified_by is None or incident.status == "pending":
+        raise HTTPException(400, "Incident must be approved before assignment")
     msg = assign_closest_responder(incident, current_user, db)
     db.commit()
     return {"message": msg, "assigned_to": incident.assigned_to}
