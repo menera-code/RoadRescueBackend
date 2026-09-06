@@ -10,6 +10,8 @@ from sqlalchemy import func, and_
 from database import SessionLocal
 from datetime import datetime, timezone
 
+from cachetools import TTLCache
+
 from models import IncidentReport, ResponderResolvedIncident
 from datetime import datetime
 
@@ -66,6 +68,9 @@ from sqlalchemy.orm import Session
 # ❌ Removed: from sklearn.neighbors import KernelDensity
 import math
 from typing import Optional
+
+# Cache for analytics endpoint (TTL = 30 seconds)
+analytics_cache = TTLCache(maxsize=1, ttl=30)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -234,50 +239,60 @@ async def get_dashboard_stats(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get dashboard statistics (Admin only)
-    """
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
-    # Get user statistics
-    user_stats = crud_users.get_user_statistics(db)
+    from sqlalchemy import func, case
     
-    # Get incident statistics (you'll need to implement this in crud_incidents.py)
-    # For now, using placeholder values
-    from models import IncidentReport
-    from sqlalchemy import func
+    # 1. User stats in one query
+    user_stats = db.query(
+        func.count(User.id).label('total'),
+        func.sum(case((User.role == 'user', 1), else_=0)).label('citizens'),
+        func.sum(case((User.role == 'responder', 1), else_=0)).label('responders'),
+        func.sum(case((User.role == 'admin', 1), else_=0)).label('administrators'),
+        func.sum(case((User.role == 'tmo', 1), else_=0)).label('tmoOfficers')
+    ).first()
     
-    total_incidents = db.query(func.count(IncidentReport.id)).scalar() or 0
-    pending = db.query(func.count(IncidentReport.id)).filter(IncidentReport.status == "pending").scalar() or 0
-    in_progress = db.query(func.count(IncidentReport.id)).filter(IncidentReport.status == "in-progress").scalar() or 0
-    resolved = db.query(func.count(IncidentReport.id)).filter(IncidentReport.status == "resolved").scalar() or 0
+    # 2. Incident stats in one query
+    incident_stats = db.query(
+        func.count(IncidentReport.id).label('total'),
+        func.sum(case((IncidentReport.status == 'pending', 1), else_=0)).label('pending'),
+        func.sum(case((IncidentReport.status == 'in-progress', 1), else_=0)).label('in_progress'),
+        func.sum(case((IncidentReport.status == 'resolved', 1), else_=0)).label('resolved')
+    ).first()
     
-    # Get recent incidents (last 10)
-    recent_incidents = db.query(IncidentReport).order_by(IncidentReport.created_at.desc()).limit(10).all()
+    # 3. Recent incidents – select only needed columns
+    recent = db.query(
+        IncidentReport.id,
+        IncidentReport.incident_type,
+        IncidentReport.severity,
+        IncidentReport.status,
+        IncidentReport.barangay,
+        IncidentReport.created_at
+    ).order_by(IncidentReport.created_at.desc()).limit(10).all()
     
-    # Format recent incidents for response
-    recent_incidents_list = []
-    for incident in recent_incidents:
-        recent_incidents_list.append({
-            "id": incident.id,
-            "type": incident.incident_type or "Unknown",
-            "severity": incident.severity or "medium",
-            "status": incident.status,
-            "barangay": incident.barangay or "Unknown",
-            "created_at": incident.created_at
-        })
+    recent_incidents_list = [
+        {
+            "id": r.id,
+            "type": r.incident_type or "Unknown",
+            "severity": r.severity or "medium",
+            "status": r.status,
+            "barangay": r.barangay or "Unknown",
+            "created_at": r.created_at
+        }
+        for r in recent
+    ]
     
     return AdminDashboardStats(
-        total_incidents=total_incidents,
-        pending=pending,
-        in_progress=in_progress,
-        resolved=resolved,
-        total_users=user_stats["total_users"],
-        citizens=user_stats.get("citizens", 0),
-        responders=user_stats.get("responders", 0),
-        tmoOfficers=user_stats.get("tmoOfficers", 0),  # You need to add this to user_stats
-        administrators=user_stats.get("administrators", 0),
+        total_incidents=incident_stats.total or 0,
+        pending=incident_stats.pending or 0,
+        in_progress=incident_stats.in_progress or 0,
+        resolved=incident_stats.resolved or 0,
+        total_users=user_stats.total or 0,
+        citizens=user_stats.citizens or 0,
+        responders=user_stats.responders or 0,
+        tmoOfficers=user_stats.tmoOfficers or 0,
+        administrators=user_stats.administrators or 0,
         recent_incidents=recent_incidents_list
     )
 
@@ -681,186 +696,155 @@ async def get_analytics_data(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Enhanced analytics with date filtering, hourly, weekly, barangay, resolution time, vehicle types, and barangay trends."""
-    try:
-        if current_user.role != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    # Parse dates, default last 30 days
+    if start_date:
+        try:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_date format")
+    else:
+        start = datetime.utcnow() - timedelta(days=30)
 
-        # Parse dates, default to last 30 days if missing
-        if start_date:
-            try:
-                start = datetime.strptime(start_date, "%Y-%m-%d")
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid start_date format")
-        else:
-            start = datetime.utcnow() - timedelta(days=30)
+    if end_date:
+        try:
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_date format")
+    else:
+        end = datetime.utcnow()
 
-        if end_date:
-            try:
-                end = datetime.strptime(end_date, "%Y-%m-%d")
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid end_date format")
-        else:
-            end = datetime.utcnow()
+    end = end + timedelta(days=1)  # inclusive end
 
-        # Ensure end is inclusive of the full day
-        end = end + timedelta(days=1)
+    # Cache key
+    cache_key = f"analytics_{start.isoformat()}_{end.isoformat()}"
+    if cache_key in analytics_cache:
+        return analytics_cache[cache_key]
 
-        # Base query for filtered period
-        base = db.query(IncidentReport).filter(
-            IncidentReport.created_at >= start,
-            IncidentReport.created_at < end
+    from sqlalchemy import func, case, extract, and_
+
+    base_filter = and_(
+        IncidentReport.created_at >= start,
+        IncidentReport.created_at < end
+    )
+
+    # ---- All aggregations in SQL ----
+    # 1. By type
+    type_rows = db.query(
+        IncidentReport.incident_type,
+        func.count(IncidentReport.id).label('cnt')
+    ).filter(base_filter, IncidentReport.incident_type.isnot(None))\
+     .group_by(IncidentReport.incident_type).all()
+    incidentsByType = [{"name": t or "Unknown", "count": cnt, "percentage": 0} for t, cnt in type_rows]
+
+    # 2. Severity distribution
+    sev_rows = db.query(
+        IncidentReport.severity,
+        func.count(IncidentReport.id).label('cnt')
+    ).filter(base_filter, IncidentReport.severity.isnot(None))\
+     .group_by(IncidentReport.severity).all()
+    severityDistribution = [{"level": s or "Unknown", "count": cnt} for s, cnt in sev_rows]
+
+    # 3. Daily activity
+    daily_rows = db.query(
+        func.date(IncidentReport.created_at).label('date'),
+        func.count(IncidentReport.id).label('cnt')
+    ).filter(base_filter).group_by('date').order_by('date').all()
+    daily = [{"date": d.strftime("%Y-%m-%d"), "activity": cnt} for d, cnt in daily_rows]
+
+    # 4. Weekly trend (last 4 weeks)
+    week_start = start - timedelta(days=start.weekday())
+    weeklyTrend = []
+    for i in range(4):
+        w_start = week_start + timedelta(weeks=i)
+        w_end = w_start + timedelta(weeks=1)
+        cnt = db.query(func.count(IncidentReport.id)).filter(
+            IncidentReport.created_at >= w_start,
+            IncidentReport.created_at < w_end
+        ).scalar() or 0
+        weeklyTrend.append({"week": w_start.strftime("%Y-%m-%d"), "count": cnt})
+
+    # 5. Barangay distribution (top 10)
+    barangay_rows = db.query(
+        IncidentReport.barangay,
+        func.count(IncidentReport.id).label('cnt')
+    ).filter(base_filter, IncidentReport.barangay.isnot(None))\
+     .group_by(IncidentReport.barangay)\
+     .order_by(func.count(IncidentReport.id).desc()).limit(10).all()
+    barangayDistribution = [{"barangay": b or "Unknown", "count": cnt} for b, cnt in barangay_rows]
+
+    # 6. Hourly distribution
+    hourly_rows = db.query(
+        extract('hour', IncidentReport.created_at).label('hour'),
+        func.count(IncidentReport.id).label('cnt')
+    ).filter(base_filter, IncidentReport.created_at.isnot(None))\
+     .group_by('hour').order_by('hour').all()
+    hourlyDistribution = [{"hour": int(h), "count": cnt} for h, cnt in hourly_rows]
+
+    # 7. Average resolution time (hours)
+    avg_res = db.query(
+        func.avg(
+            func.timestampdiff(func.hour, IncidentReport.created_at, IncidentReport.resolved_at)
         )
+    ).filter(
+        base_filter,
+        IncidentReport.status == "resolved",
+        IncidentReport.resolved_at.isnot(None),
+        IncidentReport.created_at.isnot(None)
+    ).scalar()
+    avg_resolution = round(avg_res or 0, 2)
 
-        # Incidents by type
-        type_rows = base.filter(IncidentReport.incident_type.isnot(None))\
-            .with_entities(IncidentReport.incident_type, func.count(IncidentReport.id))\
-            .group_by(IncidentReport.incident_type).all()
-        incidentsByType = [{"name": t, "count": c, "percentage": 0} for t, c in type_rows]
+    # ---- Barangay trends (today, week, month) in one query ----
+    now = datetime.utcnow()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
 
-        # Severity distribution
-        sev_rows = base.filter(IncidentReport.severity.isnot(None))\
-            .with_entities(IncidentReport.severity, func.count(IncidentReport.id))\
-            .group_by(IncidentReport.severity).all()
-        severityDistribution = [{"level": s, "count": c} for s, c in sev_rows]
+    trend_rows = db.query(
+        IncidentReport.barangay,
+        func.sum(case((IncidentReport.created_at >= today_start, 1), else_=0)).label('today'),
+        func.sum(case((IncidentReport.created_at >= week_ago, 1), else_=0)).label('week'),
+        func.sum(case((IncidentReport.created_at >= month_ago, 1), else_=0)).label('month')
+    ).filter(
+        IncidentReport.barangay.isnot(None),
+        IncidentReport.created_at >= month_ago
+    ).group_by(IncidentReport.barangay)\
+     .order_by(func.sum(case((IncidentReport.created_at >= month_ago, 1), else_=0)).desc())\
+     .limit(10).all()
 
-        # Daily activity
-        daily_rows = base.with_entities(
-            func.date(IncidentReport.created_at).label('date'),
-            func.count(IncidentReport.id)
-        ).group_by('date').order_by('date').all()
-        daily = [{"date": d.strftime("%Y-%m-%d"), "activity": cnt} for d, cnt in daily_rows]
-
-        # Weekly trend (last 4 weeks) – we compute from the start date
-        week_start = start - timedelta(days=start.weekday())  # align to Monday
-        weeks = []
-        for i in range(4):
-            w_start = week_start + timedelta(weeks=i)
-            w_end = w_start + timedelta(weeks=1)
-            cnt = db.query(func.count(IncidentReport.id)).filter(
-                IncidentReport.created_at >= w_start,
-                IncidentReport.created_at < w_end
-            ).scalar() or 0
-            weeks.append({
-                "week": w_start.strftime("%Y-%m-%d"),
-                "count": cnt
-            })
-        weeklyTrend = weeks
-
-        # Barangay distribution (top 10) – for the filtered period
-        barangay_rows = base.filter(IncidentReport.barangay.isnot(None))\
-            .with_entities(IncidentReport.barangay, func.count(IncidentReport.id))\
-            .group_by(IncidentReport.barangay).order_by(func.count(IncidentReport.id).desc()).limit(10).all()
-        barangayDistribution = [{"barangay": b, "count": c} for b, c in barangay_rows]
-
-        # Hourly distribution
-        hourly_rows = base.filter(IncidentReport.created_at.isnot(None))\
-            .with_entities(
-                func.extract('hour', IncidentReport.created_at).label('hour'),
-                func.count(IncidentReport.id)
-            ).group_by('hour').order_by('hour').all()
-        hourlyDistribution = [{"hour": int(h), "count": c} for h, c in hourly_rows]
-
-        # Average resolution time (in hours) for resolved incidents
-        resolved = base.filter(IncidentReport.status == "resolved",
-                               IncidentReport.resolved_at.isnot(None),
-                               IncidentReport.created_at.isnot(None))\
-            .with_entities(IncidentReport.created_at, IncidentReport.resolved_at).all()
-        if resolved:
-            total_hours = sum(
-                (r.resolved_at - r.created_at).total_seconds() / 3600 for r in resolved
-            )
-            avg_resolution = round(total_hours / len(resolved), 2)
-        else:
-            avg_resolution = 0
-
-        # ========== SAFE VEHICLE TYPE DISTRIBUTION ==========
-        from collections import defaultdict
-        import json
-
-        vehicle_counts = defaultdict(int)
-        incidents_in_period = base.all()
-
-        for inc in incidents_in_period:
-            # Image analysis
-            if inc.image_analysis:
-                try:
-                    img_data = json.loads(inc.image_analysis)
-                    if isinstance(img_data, dict):
-                        vehicles = img_data.get("vehicles", {})
-                        if isinstance(vehicles, dict):
-                            for vehicle, count in vehicles.items():
-                                if isinstance(count, (int, float)):
-                                    vehicle_counts[vehicle] += int(count)
-                except Exception as e:
-                    print(f"⚠️ Image analysis error for incident {inc.id}: {e}")
-
-            # Text analysis
-            if inc.text_analysis:
-                try:
-                    txt_data = json.loads(inc.text_analysis)
-                    if isinstance(txt_data, dict):
-                        vehicles = txt_data.get("mentioned_vehicles")
-                        if isinstance(vehicles, list):
-                            for vehicle in vehicles:
-                                vehicle_counts[vehicle] += 1
-                except Exception as e:
-                    print(f"⚠️ Text analysis error for incident {inc.id}: {e}")
-
-        vehicle_types = [{"type": k, "count": v} for k, v in vehicle_counts.items() if v > 0]
-        vehicle_types.sort(key=lambda x: -x["count"])
-
-        # ========== SAFE BARANGAY TRENDS (Today, Week, Month) ==========
-        
-        now = datetime.utcnow()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_start = now - timedelta(days=7)
-        month_start = now - timedelta(days=30)
-
-        barangay_periods = {}
-        for period, start_dt in [("today", today_start), ("week", week_start), ("month", month_start)]:
-            results = db.query(IncidentReport.barangay, func.count(IncidentReport.id))\
-                        .filter(IncidentReport.created_at >= start_dt)\
-                        .filter(IncidentReport.barangay.isnot(None))\
-                        .group_by(IncidentReport.barangay)\
-                        .all()
-            for barangay, cnt in results:
-                if barangay not in barangay_periods:
-                    barangay_periods[barangay] = {"today": 0, "week": 0, "month": 0}
-                barangay_periods[barangay][period] = cnt
-
-        barangay_trends = []
-        for barangay, periods in barangay_periods.items():
-            barangay_trends.append({
-                "barangay": barangay,
-                "today": periods["today"],
-                "week": periods["week"],
-                "month": periods["month"],
-                "total": periods["today"] + periods["week"] + periods["month"]
-            })
-        barangay_trends.sort(key=lambda x: -x["total"])
-        barangay_trends = barangay_trends[:10]
-
-        return {
-            "incidentsByType": incidentsByType,
-            "severityDistribution": severityDistribution,
-            "activitySummary": {
-                "daily": daily,
-                "weekly": weeklyTrend,
-                "monthly": []  # optional
-            },
-            "barangayDistribution": barangayDistribution,
-            "hourlyDistribution": hourlyDistribution,
-            "weeklyTrend": weeklyTrend,
-            "avgResolutionHours": avg_resolution,
-            "vehicleTypes": vehicle_types,
-            "barangayTrends": barangay_trends,
+    barangay_trends = [
+        {
+            "barangay": row.barangay,
+            "today": row.today,
+            "week": row.week,
+            "month": row.month,
+            "total": row.month
         }
+        for row in trend_rows
+    ]
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    # Build result (vehicleTypes removed for speed)
+    result = {
+        "incidentsByType": incidentsByType,
+        "severityDistribution": severityDistribution,
+        "activitySummary": {
+            "daily": daily,
+            "weekly": weeklyTrend,
+            "monthly": []
+        },
+        "barangayDistribution": barangayDistribution,
+        "hourlyDistribution": hourlyDistribution,
+        "weeklyTrend": weeklyTrend,
+        "avgResolutionHours": avg_resolution,
+        "vehicleTypes": [],          # Removed to speed up
+        "barangayTrends": barangay_trends,
+    }
+
+    # Store in cache
+    analytics_cache[cache_key] = result
+    return result
 # ================= USER CREATION ENDPOINT =================
 
 @router.post("/users", response_model=UserProfileOut)
