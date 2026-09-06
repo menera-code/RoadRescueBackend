@@ -649,7 +649,7 @@ async def get_analytics_data(
     # Average resolution time (hours)
     avg_res = db.query(
         func.avg(
-            func.timestampdiff('hour', IncidentReport.created_at, IncidentReport.resolved_at)
+            func.TIMESTAMPDIFF('hour', IncidentReport.created_at, IncidentReport.resolved_at)
         )
     ).filter(
         base_filter,
