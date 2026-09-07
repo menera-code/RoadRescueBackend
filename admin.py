@@ -6,7 +6,7 @@ from pydantic import BaseModel, EmailStr, validator
 from typing import Optional
 from datetime import datetime
 from models import ChatHistory
-from sqlalchemy import func, and_, or_, case, extract
+from sqlalchemy import func, and_, or_, case, extract, text
 from database import SessionLocal
 from datetime import datetime, timezone
 
