@@ -1,7 +1,7 @@
 import os, shutil
 import traceback
 import json
-import google.generativeai as genai
+import google.genai as genai
 import requests
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import random
