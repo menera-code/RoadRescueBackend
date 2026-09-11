@@ -27,7 +27,7 @@ import os
 import uuid
 from fastapi import File, UploadFile, Form, Request
 
-from services.predictor import predict_text, analyze_image, analyze_video
+
 from schemas import LegalComplianceResponse
 # Import your modules
 from models import ResponderLocation
@@ -76,8 +76,7 @@ from models import IncidentReport, ResponderResolvedIncident
 import ml_analytics
 
 # ---------- FIREBASE IMPORTS ----------
-import firebase_admin
-from firebase_admin import credentials, storage
+
 import tempfile
 import io
 # -------------------------------------
@@ -114,24 +113,34 @@ async def options_handler(full_path: str):
 # cred = credentials.Certificate("path/to/your-firebase-adminsdk.json")
 
 # For RENDER (recommended): read from environment variable
-cred_dict = json.loads(os.environ.get("FIREBASE_CRED"))
-cred = credentials.Certificate(cred_dict)
+import firebase_admin
+from firebase_admin import credentials, storage
 
-firebase_admin.initialize_app(cred, {
-    'storageBucket': 'roadrescue-storage.firebasestorage.app'   # your bucket name
-})
-bucket = storage.bucket()
+_firebase_bucket = None
+
+def get_firebase_bucket():
+    """Lazy-init Firebase on first use to save ~150 MB at startup."""
+    global _firebase_bucket
+    if _firebase_bucket is None:
+        if not firebase_admin._apps:
+            cred_dict = json.loads(os.environ.get("FIREBASE_CRED"))
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred, {
+                'storageBucket': 'roadrescue-storage.firebasestorage.app'
+            })
+        _firebase_bucket = storage.bucket()
+    return _firebase_bucket
 # --------------------------------------------
 
 # Helper: upload bytes to Firebase and return public URL
 def upload_file_to_firebase(file_bytes: bytes, folder: str, filename: str, content_type: str) -> str:
     """Upload bytes to Firebase Storage and return public URL."""
-    blob_path = f"{folder}/{filename}"   # e.g., "uploads/images/uuid.jpg"
+    bucket = get_firebase_bucket()          # ← changed
+    blob_path = f"{folder}/{filename}"
     blob = bucket.blob(blob_path)
     blob.upload_from_string(file_bytes, content_type=content_type)
     blob.make_public()
     return blob.public_url
-
 
 @app.middleware("http")
 async def update_last_active_middleware(request: Request, call_next):
@@ -1064,6 +1073,7 @@ async def submit_incident_report(
             firebase_urls.append({"url": public_url, "type": file_type})
         
         # ---- Text analysis (fast) ----
+        from services.predictor import predict_text
         text_pred = predict_text(description)
         
         # ---- Build incident data (no image/video ML yet) ----
@@ -1207,6 +1217,7 @@ async def process_media_analysis(incident_id: str, firebase_urls: list, db: Sess
 async def analyze_text(text: str = Form(...)):
     try:
         # Use the predictor directly
+        from services.predictor import predict_text
         result = predict_text(text)
         # result has keys: incident_type, severity, type_confidence, severity_confidence,
         #                   all_type_scores (dict), all_severity_scores (dict)
